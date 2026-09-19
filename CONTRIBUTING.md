@@ -26,3 +26,7 @@ uv run mypy matimo_agdk
   `respx` to mock httpx calls -- never hit a real network in a unit test.
 - Latency/overhead claims must be measured, never invented. Label anything
   unmeasured as unmeasured.
+
+## Releasing
+
+Maintainers: see [docs/RELEASING.md](docs/RELEASING.md). Pushing a `vX.Y.Z` tag publishes to PyPI.

@@ -1,0 +1,134 @@
+name: release
+
+# Pushing a tag vX.Y.Z (or a PEP 440 prerelease such as v0.2.0rc1) publishes matimo-agdk to
+# PyPI and creates the GitHub Release. See docs/RELEASING.md for the full procedure.
+#
+# Running this workflow by hand (Actions > release > Run workflow) is a dry run: it validates
+# the version files, runs the full CI gate and builds the package, but never publishes.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+# Deny everything by default; each job declares only what it needs.
+permissions: {}
+
+# Two pushes of the same tag must not race to upload the same files.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PUBLISH: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Refuse to release anything whose tag, version files or changelog disagree.
+  # Cheap, and runs before the (slower) test matrix.
+  # ---------------------------------------------------------------------------
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v3
+
+      - name: Tag commit must be on main
+        if: env.PUBLISH == 'true'
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME points at a commit that is not on main. Merge it first, then tag main."
+            exit 1
+          fi
+
+      - name: Tag, pyproject.toml and __version__ must agree
+        id: check
+        run: |
+          set -euo pipefail # without pipefail, `| tee` would hide a failing check
+          TAG_ARG=""
+          if [ "$PUBLISH" = "true" ]; then TAG_ARG="$GITHUB_REF_NAME"; fi
+          uv run --no-project --python 3.13 python scripts/release.py check $TAG_ARG | tee -a "$GITHUB_OUTPUT"
+
+      - name: CHANGELOG.md must have a section for this version
+        if: env.PUBLISH == 'true'
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          uv run --no-project --python 3.13 python scripts/release.py notes "$VERSION" > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
+            echo "::error::CHANGELOG.md section for $VERSION is empty."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Full gate: lint, format, mypy and pytest on every supported Python, plus the
+  # build + clean-install smoke test. Uploads the `dist` artifact that gets published.
+  # ---------------------------------------------------------------------------
+  ci:
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  # ---------------------------------------------------------------------------
+  # Publish to PyPI via trusted publishing (OIDC): no API token is stored in GitHub.
+  # The `pypi` environment is where required reviewers can be added as a last manual gate.
+  # ---------------------------------------------------------------------------
+  publish-pypi:
+    needs: [validate, ci]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/matimo-agdk/${{ needs.validate.outputs.version }}/
+    permissions:
+      id-token: write # required for PyPI trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release, with notes taken from CHANGELOG.md and the same files as PyPI.
+  # Runs only after PyPI accepted the upload, so a Release never advertises a
+  # version that is not installable.
+  # ---------------------------------------------------------------------------
+  github-release:
+    needs: [validate, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        run: |
+          uv run --no-project --python 3.13 python scripts/release.py notes "$VERSION" > "$RUNNER_TEMP/notes.md"
+          FLAGS=""
+          if [ "$PRERELEASE" = "true" ]; then FLAGS="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "matimo-agdk $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            $FLAGS

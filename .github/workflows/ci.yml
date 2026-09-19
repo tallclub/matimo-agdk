@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Reused by release.yml as the gate that runs before anything is published.
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -39,6 +44,37 @@ jobs:
         run: uv run mypy --python-version ${{ matrix.python }} matimo_agdk
       - name: Tests
         run: uv run pytest -q ${{ matrix.pytest_args }}
+
+  # Builds the sdist + wheel and proves they are installable, so a broken package is
+  # caught on the PR rather than at release time. The artifact uploaded here is exactly
+  # what release.yml publishes.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.13
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check package metadata
+        run: uvx twine check --strict dist/*
+      - name: Smoke test the wheel in a clean environment
+        run: |
+          uv venv --python 3.13 "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke/bin/python" dist/*.whl
+          # Run from outside the checkout so the installed wheel is imported, not ./matimo_agdk.
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/python" -c "import matimo_agdk; print('matimo_agdk', matimo_agdk.__version__)"
+          "$RUNNER_TEMP/smoke/bin/matimo-agdk" --help > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
 
   commitlint:
     if: github.event_name == 'pull_request'
