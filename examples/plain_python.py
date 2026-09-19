@@ -16,7 +16,16 @@ from __future__ import annotations
 
 import sys
 
+# --- Matimo AGDK imports (same three roles in every example) ---------------
+# 1. Governor: the core object. Holds this agent's registered identity, sends
+#    telemetry to Matimo Gateway, and answers "is this tool call allowed?".
 from matimo_agdk import Governor
+
+# 2. No framework adapter here: with plain Python there is nothing to hook, so
+#    the Governor is used directly. governor.guard() does the enforcement and
+#    governor.httpx_client() does the LLM routing (see the calls below).
+#    matimo_agdk.adapters.generic.govern() is the shortcut for guarding a whole
+#    dict/list of tool functions at once.
 
 
 def search(query: str) -> str:
@@ -29,17 +38,21 @@ def search(query: str) -> str:
 def main() -> None:
     mission = " ".join(sys.argv[1:]) or "What is the capital of India?"
 
+    # Matimo: load the identity created by `matimo-agdk register` (plus the
+    # API key / Gateway URL from env vars), then start background telemetry.
     governor = Governor.from_env(agent_name="plain-python-demo")
     governor.start()
 
     try:
+        # Matimo: groups every span below under one run in the Gateway UI.
         with governor.run("plain-python-example"):
-            # 1. A governed tool call: policy-checked, span-recorded,
-            #    result reported. Raises ToolDenied if the policy says no.
+            # 1. Matimo enforcement -- a governed tool call: policy-checked,
+            #    span-recorded, result reported. Raises ToolDenied if the
+            #    policy says no.
             result = governor.guard(search, name="search", category="web")(query=mission)
             print(f"Tool result: {result}")
 
-            # 2. An LLM call routed through Gateway, not the real OpenAI
+            # 2. Matimo LLM routing -- an LLM call routed through Gateway, not the real OpenAI
             #    API -- Gateway resolves the tenant's own BYOK credentials
             #    server-side, this process never sees them. Requires the
             #    `openai` package (not a matimo_agdk dependency):
@@ -66,12 +79,15 @@ def main() -> None:
             answer = response.choices[0].message.content
             print(f"LLM answer: {answer}")
 
+            # Matimo telemetry -- with no framework adapter to record LLM
+            # calls automatically, report this one by hand.
             governor.llm_span(
                 model="gpt-4o-mini",
                 provider="openai",
                 finish_reasons=[response.choices[0].finish_reason],
             )
     finally:
+        # Matimo: flush any queued telemetry and stop the background thread.
         governor.stop()
 
 
