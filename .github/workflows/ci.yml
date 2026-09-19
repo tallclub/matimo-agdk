@@ -11,7 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12"]
+        include:
+          - python: "3.13"
+            extras: "--all-extras"
+          # crewai cannot be imported on 3.14 yet (verified 2026-09-19 with crewai 1.15.22:
+          # chromadb's pydantic.v1 models raise ConfigError), so 3.14 covers every other
+          # extra. Move it to --all-extras and drop pytest_args once crewai supports 3.14.
+          - python: "3.14"
+            extras: "--extra langchain --extra google-adk --extra autogen"
+            pytest_args: "--ignore=tests/adapters/test_crewai.py"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -20,15 +28,17 @@ jobs:
       - name: Set up Python ${{ matrix.python }}
         run: uv python install ${{ matrix.python }}
       - name: Install
-        run: uv sync --all-extras --group dev --python ${{ matrix.python }}
+        run: uv sync ${{ matrix.extras }} --group dev --python ${{ matrix.python }}
       - name: Lint
         run: uv run ruff check .
       - name: Format check
         run: uv run ruff format --check .
+      # pyproject.toml pins mypy to the 3.13 floor; check each matrix entry against the
+      # interpreter it is actually running on so 3.14 is type-checked as 3.14.
       - name: Type check
-        run: uv run mypy matimo_agdk
+        run: uv run mypy --python-version ${{ matrix.python }} matimo_agdk
       - name: Tests
-        run: uv run pytest -q
+        run: uv run pytest -q ${{ matrix.pytest_args }}
 
   commitlint:
     if: github.event_name == 'pull_request'

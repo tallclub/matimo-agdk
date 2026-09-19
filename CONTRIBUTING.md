@@ -17,7 +17,7 @@ uv run mypy matimo_agdk
 
 ## Conventions
 
-- Python >= 3.10. No em-dash character anywhere in code, comments, or
+- Python >= 3.13. No em-dash character anywhere in code, comments, or
   docs -- use a comma, period, or colon instead.
 - No framework dependency in `matimo_agdk` core -- adapters live in
   `matimo_agdk/adapters/<framework>.py` behind an optional extra.

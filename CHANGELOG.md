@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file.
 
 Initial core SDK build. Not yet published to PyPI.
 
+### Changed (2026-09-19, Python floor)
+
+- `requires-python` raised from 3.11 to 3.13; classifiers list 3.13 and 3.14.
+  CI runs 3.13 with every extra and 3.14 with every extra except `crewai`:
+  CrewAI cannot be imported on Python 3.14 yet (verified with crewai 1.15.22:
+  chromadb's `pydantic.v1` models raise `ConfigError`), so the `crewai`
+  adapter is untested on 3.14. ruff and mypy now target 3.13.
+
 ### Fixed (2026-09-18, telemetry richness parity across adapters)
 
 - CrewAI and AutoGen now emit LLM spans, not just tool spans -- found live
