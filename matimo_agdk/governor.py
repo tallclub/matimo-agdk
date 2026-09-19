@@ -217,7 +217,7 @@ class Governor:
         if self._identity is None:
             raise GatewayError(
                 "Governor has no identity: call governor.register(...) once, "
-                "or run `matimo register` and then Governor.from_env()."
+                "or run `matimo-agdk register` and then Governor.from_env()."
             )
         if self._started:
             return self
@@ -650,7 +650,7 @@ class AsyncGovernor:
         if self._identity is None:
             raise GatewayError(
                 "Governor has no identity: call governor.register(...) once, "
-                "or run `matimo register` and then AsyncGovernor.from_env()."
+                "or run `matimo-agdk register` and then AsyncGovernor.from_env()."
             )
         if self._started:
             return self

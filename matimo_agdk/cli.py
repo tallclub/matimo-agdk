@@ -58,7 +58,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     config = _build_config(args)
     governor = Governor(config)
     if governor.identity is None:
-        print("error: no identity found. Run `matimo register` first.", file=sys.stderr)
+        print("error: no identity found. Run `matimo-agdk register` first.", file=sys.stderr)
         return 1
     try:
         governor.start()
@@ -86,7 +86,7 @@ def cmd_rotate_key(args: argparse.Namespace) -> int:
     config = _build_config(args)
     governor = Governor(config)
     if governor.identity is None:
-        print("error: no identity found. Run `matimo register` first.", file=sys.stderr)
+        print("error: no identity found. Run `matimo-agdk register` first.", file=sys.stderr)
         return 1
     try:
         identity = governor.rotate_key()
@@ -110,7 +110,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     governor = Governor(config)
     if governor.identity is None:
-        print("  [FAIL] no identity found -- run `matimo register` first")
+        print("  [FAIL] no identity found -- run `matimo-agdk register` first")
         return 1
     print(f"  [ok] identity loaded: {governor.identity.identity_id}")
 

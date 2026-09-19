@@ -1,7 +1,7 @@
 """GatewayConfig: the one settings object a Governor is built from.
 
 Load precedence, highest wins: explicit kwargs > environment variables > a
-persisted credentials file written by `matimo register` (see
+persisted credentials file written by `matimo-agdk register` (see
 matimo_agdk.identity.save_credentials). Building a GatewayConfig never
 talks to the network -- it is pure local state assembly.
 """
