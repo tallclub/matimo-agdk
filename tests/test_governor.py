@@ -8,6 +8,7 @@ from matimo_agdk.config import GatewayConfig
 from matimo_agdk.exceptions import GatewayError, ToolDenied
 from matimo_agdk.governor import Governor
 from matimo_agdk.identity import IdentityCredentials, load_credentials
+from matimo_agdk.tools import NO_RESUME_TOKEN_DENY_REASON
 
 from .conftest import BASE_URL, future_iso
 
@@ -226,6 +227,50 @@ def test_guard_pending_then_approved_runs_function(
         with governor.run("test-run"):
             result = governor.guard(send_email, name="send_email")(to="a@example.com")
         assert result == "sent to a@example.com"
+    finally:
+        governor.stop()
+
+
+@respx.mock
+def test_guard_tokenless_pending_denies_and_never_runs_the_function(
+    identity: IdentityCredentials, credentials_dir
+) -> None:
+    """Gateway can answer PENDING with no resumeToken (an identical check is
+    already in flight). guard() used to treat that as "not denied" and run
+    the tool without the approval a policy demanded."""
+    respx.post(f"{BASE_URL}/sessions").mock(
+        return_value=httpx.Response(
+            201,
+            json={
+                "data": {"sessionToken": "tok", "expiresAt": future_iso(3600), "identityId": "x"}
+            },
+        )
+    )
+    check_route = respx.post(f"{BASE_URL}/tools/check").mock(
+        return_value=httpx.Response(
+            200, json={"data": {"decision": "PENDING", "reason": "duplicate_check_in_flight"}}
+        )
+    )
+    respx.post(f"{BASE_URL}/telemetry/batch").mock(
+        return_value=httpx.Response(200, json={"data": {"accepted": 0, "failed": []}})
+    )
+
+    governor = Governor(bound_config(identity, credentials_dir))
+    governor.start()
+    try:
+        governor._tools.recheck_delays = (0.0, 0.0)  # noqa: SLF001
+        ran: list[str] = []
+
+        def send_email(to: str) -> str:
+            ran.append(to)
+            return f"sent to {to}"
+
+        with governor.run("test-run"):
+            with pytest.raises(ToolDenied) as excinfo:
+                governor.guard(send_email, name="send_email")(to="a@example.com")
+        assert excinfo.value.reason == NO_RESUME_TOKEN_DENY_REASON
+        assert ran == []
+        assert check_route.call_count == 3  # first check + two rechecks
     finally:
         governor.stop()
 

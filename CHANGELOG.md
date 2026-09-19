@@ -14,6 +14,31 @@ Initial core SDK build. Not yet published to PyPI.
   chromadb's `pydantic.v1` models raise `ConfigError`), so the `crewai`
   adapter is untested on 3.14. ruff and mypy now target 3.13.
 
+### Fixed (2026-09-19, tool check could run a tool that policy held for approval)
+
+- Gateway answers `PENDING` with **no `resumeToken`** when an identical tool
+  check is already in flight (`reason: "duplicate_check_in_flight"`, raised
+  by the server's duplicate-pending race handling in
+  `GatewayToolCheckService.checkTool`). Every call site only polled when a
+  token was present and only refused on `DENY`, so a tokenless `PENDING`
+  fell straight through and the tool ran without the approval a policy
+  required -- in `Governor.guard()`, `AsyncGovernor.guard()`, and all of the
+  framework adapters (they share `adapters/_shared.py`). Reproduced with a
+  mocked tokenless `PENDING`: the guarded function executed.
+- New `ToolGovernor.check_and_wait()` / `AsyncToolGovernor.check_and_wait()`
+  (also `Governor.check_and_wait()` / `AsyncGovernor.check_and_wait()`) is
+  now the single place a check is resolved to a final `ALLOW`/`DENY`: a
+  `PENDING` with a token is polled as before; a tokenless `PENDING` is
+  re-checked after 0.5s, 1s, 2s and 4s (the in-flight check's answer is
+  cached server-side for 15 minutes, so the retry normally returns the
+  token) and, if it still has none, becomes `DENY` with reason
+  `tool_check_pending_without_resume_token` -- fail closed. `guard()` and
+  every adapter now call it. `check_tool()`/`await_decision()` are
+  unchanged for callers who drive the two steps by hand; those callers must
+  handle a tokenless `PENDING` themselves.
+- Corrected two stale comments in `tools.py` (initial poll interval is 3s,
+  not 2s; the jitter is a uniform +/-10%, not "decorrelated").
+
 ### Fixed (2026-09-18, telemetry richness parity across adapters)
 
 - CrewAI and AutoGen now emit LLM spans, not just tool spans -- found live

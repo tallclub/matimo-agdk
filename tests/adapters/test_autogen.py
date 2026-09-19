@@ -45,12 +45,14 @@ async def test_observe_mode_never_calls_check_tool() -> None:
 
     gov = MagicMock()
     gov.check_tool = AsyncMock()
+    gov.check_and_wait = AsyncMock()
     gov.tool_span = MagicMock()
 
     tools = govern_tools([_fresh_tool()], gov, mode="observe")
     result = await tools[0].run_json({"a": 1, "b": 2}, CancellationToken())
     assert result == 3
     gov.check_tool.assert_not_called()
+    gov.check_and_wait.assert_not_called()
     gov.tool_span.assert_called_once()
     assert gov.tool_span.call_args.kwargs["status"] == "completed"
 
@@ -153,12 +155,14 @@ async def test_suspended_state_stops_before_tool_call() -> None:
 
     gov = MagicMock()
     gov.check_tool = AsyncMock(return_value=ToolDecision(decision="ALLOW"))
+    gov.check_and_wait = AsyncMock(return_value=ToolDecision(decision="ALLOW"))
     gov.raise_if_suspended = MagicMock(side_effect=AgentSuspendedLocally("suspended", False))
 
     tools = govern_tools([_fresh_tool()], gov, mode="govern")
     with pytest.raises(AgentSuspendedLocally):
         await tools[0].run_json({"a": 1, "b": 1}, CancellationToken())
     gov.check_tool.assert_not_called()
+    gov.check_and_wait.assert_not_called()
 
 
 def test_gateway_model_client_requires_async_governor() -> None:

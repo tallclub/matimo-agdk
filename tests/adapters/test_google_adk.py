@@ -67,6 +67,7 @@ async def test_observe_mode_never_calls_check_tool() -> None:
 
     gov = MagicMock()
     gov.check_tool = AsyncMock()
+    gov.check_and_wait = AsyncMock()
     gov.tool_span = MagicMock()
 
     plugin = MatimoPlugin(gov, mode="observe")
@@ -75,6 +76,7 @@ async def test_observe_mode_never_calls_check_tool() -> None:
     )
     assert result is None
     gov.check_tool.assert_not_called()
+    gov.check_and_wait.assert_not_called()
 
     await plugin.after_tool_callback(
         tool=_Tool(), tool_args={"q": "hi"}, tool_context=_Ctx(), result={"ok": True}
@@ -170,12 +172,14 @@ async def test_suspended_state_stops_before_tool_call() -> None:
 
     gov = MagicMock()
     gov.check_tool = AsyncMock(return_value=ToolDecision(decision="ALLOW"))
+    gov.check_and_wait = AsyncMock(return_value=ToolDecision(decision="ALLOW"))
     gov.raise_if_suspended = MagicMock(side_effect=AgentSuspendedLocally("suspended", False))
 
     plugin = MatimoPlugin(gov, mode="govern")
     with pytest.raises(AgentSuspendedLocally):
         await plugin.before_tool_callback(tool=_Tool(), tool_args={}, tool_context=_Ctx())
     gov.check_tool.assert_not_called()
+    gov.check_and_wait.assert_not_called()
 
 
 @pytest.mark.asyncio

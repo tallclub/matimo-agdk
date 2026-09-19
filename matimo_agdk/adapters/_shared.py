@@ -91,9 +91,7 @@ def sync_check_and_wait(
             "an AsyncGovernor was passed to a synchronous governed call site -- "
             "use a sync Governor here, or use this adapter's async entry point"
         )
-    decision = governor.check_tool(tool_name, args, category_hint=category)
-    if decision.pending and decision.resume_token:
-        decision = governor.await_decision(decision.resume_token)
+    decision = governor.check_and_wait(tool_name, args, category_hint=category)
     if decision.denied:
         emit_tool_span(governor, tool_name, status="denied", duration_ms=0, arguments=args)
     return decision
@@ -107,15 +105,11 @@ async def async_check_and_wait(
     the sync Governor's blocking calls via asyncio.to_thread so the event
     loop is never blocked."""
     if is_async_governor(governor):
-        decision = await governor.check_tool(tool_name, args, category_hint=category)
-        if decision.pending and decision.resume_token:
-            decision = await governor.await_decision(decision.resume_token)
+        decision = await governor.check_and_wait(tool_name, args, category_hint=category)
     else:
         decision = await asyncio.to_thread(
-            governor.check_tool, tool_name, args, category_hint=category
+            governor.check_and_wait, tool_name, args, category_hint=category
         )
-        if decision.pending and decision.resume_token:
-            decision = await asyncio.to_thread(governor.await_decision, decision.resume_token)
     if decision.denied:
         emit_tool_span(governor, tool_name, status="denied", duration_ms=0, arguments=args)
     return decision

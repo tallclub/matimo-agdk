@@ -347,6 +347,15 @@ class Governor:
             raise GatewayError("Governor has no bound identity")
         return self._tools.await_decision(resume_token, **kwargs)
 
+    def check_and_wait(
+        self, tool_name: str, args: dict[str, Any] | None = None, **kwargs: Any
+    ) -> ToolDecision:
+        """check_tool(), then poll a PENDING to its final ALLOW/DENY. Never
+        returns PENDING -- see ToolGovernor.check_and_wait()."""
+        if self._tools is None:
+            raise GatewayError("Governor has no bound identity")
+        return self._tools.check_and_wait(tool_name, args, **kwargs)
+
     def set_tool_category(self, tool_name: str, category: str) -> None:
         if self._tools is None:
             raise GatewayError("Governor has no bound identity")
@@ -388,9 +397,7 @@ class Governor:
                     with self.run(f"tool:{tool_name}"):
                         return wrapper(*args, **kwargs)
                 call_args = _positional_to_kwargs(args, kwargs)
-                decision = tools.check(tool_name, call_args, category_hint=category)
-                if decision.pending and decision.resume_token:
-                    decision = tools.await_decision(decision.resume_token)
+                decision = tools.check_and_wait(tool_name, call_args, category_hint=category)
                 if decision.denied:
                     self.tool_span(tool_name, status="denied", duration_ms=0, arguments=call_args)
                     raise ToolDenied(decision.reason)
@@ -773,6 +780,14 @@ class AsyncGovernor:
             raise GatewayError("Governor has no bound identity")
         return await self._tools.await_decision(resume_token, **kwargs)
 
+    async def check_and_wait(
+        self, tool_name: str, args: dict[str, Any] | None = None, **kwargs: Any
+    ) -> ToolDecision:
+        """Async twin of Governor.check_and_wait()."""
+        if self._tools is None:
+            raise GatewayError("Governor has no bound identity")
+        return await self._tools.check_and_wait(tool_name, args, **kwargs)
+
     async def set_tool_category(self, tool_name: str, category: str) -> None:
         if self._tools is None:
             raise GatewayError("Governor has no bound identity")
@@ -799,9 +814,7 @@ class AsyncGovernor:
                     async with self.run(f"tool:{tool_name}"):
                         return await wrapper(*args, **kwargs)
                 call_args = _positional_to_kwargs(args, kwargs)
-                decision = await tools.check(tool_name, call_args, category_hint=category)
-                if decision.pending and decision.resume_token:
-                    decision = await tools.await_decision(decision.resume_token)
+                decision = await tools.check_and_wait(tool_name, call_args, category_hint=category)
                 if decision.denied:
                     self.tool_span(tool_name, status="denied", duration_ms=0, arguments=call_args)
                     raise ToolDenied(decision.reason)
