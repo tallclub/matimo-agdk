@@ -294,4 +294,4 @@ See `CONTRIBUTING.md`.
 
 ## License
 
-MIT, copyright 2026 roaiq Technologies. See `LICENSE`.
+MIT, copyright 2026 ROAIQ Technologies. See `LICENSE`.
