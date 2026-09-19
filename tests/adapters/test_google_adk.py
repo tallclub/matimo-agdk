@@ -282,6 +282,82 @@ async def test_before_model_binds_invocation_id_as_current_run() -> None:
     gov.bind_run_id.assert_called_once_with("inv-42")
 
 
+class _RunCtx:
+    def __init__(self, invocation_id: str = "e-inv-1", agent_name: str = "weather_agent") -> None:
+        self.invocation_id = invocation_id
+        self.agent = MagicMock()
+        self.agent.name = agent_name
+
+
+@pytest.mark.asyncio
+async def test_run_opens_running_then_closes_completed() -> None:
+    from matimo_agdk.adapters.google_adk import MatimoPlugin
+
+    gov = MagicMock()
+    plugin = MatimoPlugin(gov, mode="govern")
+    ctx = _RunCtx()
+
+    assert await plugin.before_run_callback(invocation_context=ctx) is None
+    gov.run_span.assert_called_once_with("e-inv-1", status="running", name="weather_agent")
+
+    gov.run_span.reset_mock()
+    await plugin.after_run_callback(invocation_context=ctx)
+    gov.run_span.assert_called_once()
+    args, kwargs = gov.run_span.call_args
+    assert args == ("e-inv-1",)
+    assert kwargs["status"] == "completed"
+    assert kwargs["name"] == "weather_agent"
+    assert kwargs["duration_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_run_error_closes_failed_and_only_once() -> None:
+    from matimo_agdk.adapters.google_adk import MatimoPlugin
+
+    gov = MagicMock()
+    plugin = MatimoPlugin(gov, mode="observe")
+    ctx = _RunCtx()
+
+    await plugin.before_run_callback(invocation_context=ctx)
+    gov.run_span.reset_mock()
+    await plugin.on_run_error_callback(invocation_context=ctx, error=RuntimeError("boom"))
+    assert gov.run_span.call_args.kwargs["status"] == "failed"
+
+    # A second terminal notification for the same invocation must not re-emit.
+    gov.run_span.reset_mock()
+    await plugin.after_run_callback(invocation_context=ctx)
+    gov.run_span.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_span_failure_never_breaks_the_agent() -> None:
+    from matimo_agdk.adapters.google_adk import MatimoPlugin
+
+    gov = MagicMock()
+    gov.run_span.side_effect = RuntimeError("telemetry down")
+    plugin = MatimoPlugin(gov, mode="govern")
+    ctx = _RunCtx()
+
+    assert await plugin.before_run_callback(invocation_context=ctx) is None
+    await plugin.after_run_callback(invocation_context=ctx)
+
+
+@pytest.mark.asyncio
+async def test_governor_run_span_emits_kind_run_event() -> None:
+    from matimo_agdk.governor import AsyncGovernor
+
+    gov = AsyncGovernor.__new__(AsyncGovernor)
+    gov._telemetry = MagicMock()
+    gov.run_span("e-inv-9", status="completed", name="adk", duration_ms=12)
+
+    event = gov._telemetry.submit.call_args.args[0]
+    assert event["kind"] == "run"
+    assert event["runId"] == "e-inv-9"
+    assert event["sessionId"] == "e-inv-9"
+    assert event["status"] == "completed"
+    assert event["durationMs"] == 12
+
+
 def _real_span_governor() -> tuple[object, MagicMock]:
     """A real AsyncGovernor whose exporter is a mock, so the *real* span
     builders run (a MagicMock governor accepts any kwargs and cannot catch a
