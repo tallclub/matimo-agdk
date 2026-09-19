@@ -151,6 +151,8 @@ def llm_span(
     started_at: str | None = None,
     duration_ms: int | None = None,
     session_id: str | None = None,
+    span_id: str | None = None,
+    parent_span_id: str | None = None,
     model: str | None = None,
     provider: str | None = None,
     finish_reasons: list[str] | None = None,
@@ -180,6 +182,8 @@ def llm_span(
         started_at=started_at,
         duration_ms=duration_ms,
         session_id=session_id,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
         attributes=attrs,
     )
 
@@ -192,6 +196,8 @@ def tool_span(
     started_at: str | None = None,
     duration_ms: int | None = None,
     session_id: str | None = None,
+    span_id: str | None = None,
+    parent_span_id: str | None = None,
     call_id: str | None = None,
     arguments: Any | None = None,
     result: Any | None = None,
@@ -214,6 +220,8 @@ def tool_span(
         started_at=started_at,
         duration_ms=duration_ms,
         session_id=session_id,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
         attributes=attrs,
     )
 

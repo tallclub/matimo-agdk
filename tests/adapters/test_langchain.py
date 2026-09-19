@@ -306,3 +306,33 @@ def test_gateway_chat_model_rejects_unknown_provider() -> None:
     gov = MagicMock()
     with pytest.raises(ValueError):
         gateway_chat_model(gov, provider="bogus")
+
+
+def test_llm_and_tool_spans_reach_the_exporter_through_real_builders() -> None:
+    """A MagicMock governor accepts any kwargs, so it cannot catch a kwarg the
+    span builders don't know about (`span_id`/`parent_span_id` were silently
+    dropped that way). Run the real builders against a mock exporter."""
+    import uuid
+
+    from matimo_agdk.adapters.langchain import MatimoCallbackHandler
+    from matimo_agdk.governor import Governor
+
+    gov = Governor.__new__(Governor)
+    gov._telemetry = MagicMock()
+    handler = MatimoCallbackHandler(gov, mode="observe")
+
+    chain_id, llm_id = uuid.uuid4(), uuid.uuid4()
+
+    class FakeResult:
+        llm_output = {"model_name": "gpt-4o-mini", "token_usage": {}}
+        generations = [[]]
+
+    handler.on_chain_start({}, {}, run_id=chain_id, parent_run_id=None)
+    handler.on_chat_model_start({"kwargs": {}}, [[]], run_id=llm_id, parent_run_id=chain_id)
+    handler.on_llm_end(FakeResult(), run_id=llm_id, parent_run_id=chain_id)
+
+    events = [c.args[0] for c in gov._telemetry.submit.call_args_list]
+    assert [e["kind"] for e in events] == ["llm"]
+    assert events[0]["runId"] == str(chain_id)
+    assert events[0]["spanId"] == str(llm_id)
+    assert events[0]["parentSpanId"] == str(chain_id)

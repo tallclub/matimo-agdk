@@ -280,3 +280,44 @@ async def test_before_model_binds_invocation_id_as_current_run() -> None:
         llm_request=_LlmRequest(model="gemini-2.0-flash"),
     )
     gov.bind_run_id.assert_called_once_with("inv-42")
+
+
+def _real_span_governor() -> tuple[object, MagicMock]:
+    """A real AsyncGovernor whose exporter is a mock, so the *real* span
+    builders run (a MagicMock governor accepts any kwargs and cannot catch a
+    kwarg the builders don't know about -- which is how `span_id` was being
+    silently dropped)."""
+    from matimo_agdk.governor import AsyncGovernor
+
+    gov = AsyncGovernor.__new__(AsyncGovernor)
+    gov._telemetry = MagicMock()
+    return gov, gov._telemetry
+
+
+@pytest.mark.asyncio
+async def test_llm_and_tool_spans_reach_the_exporter_through_real_builders() -> None:
+    from matimo_agdk.adapters.google_adk import MatimoPlugin
+
+    gov, telemetry = _real_span_governor()
+    plugin = MatimoPlugin(gov, mode="observe")
+    ctx = _CallbackCtx(invocation_id="e-inv-7")
+
+    await plugin.before_model_callback(callback_context=ctx, llm_request=_LlmRequest("gpt-4o-mini"))
+    await plugin.after_model_callback(callback_context=ctx, llm_response=_LlmResponse())
+    await plugin.before_tool_callback(
+        tool=_Tool("get_weather"), tool_args={"city": "x"}, tool_context=_Ctx("call-9", "e-inv-7")
+    )
+    await plugin.after_tool_callback(
+        tool=_Tool("get_weather"),
+        tool_args={"city": "x"},
+        tool_context=_Ctx("call-9", "e-inv-7"),
+        result={"ok": True},
+    )
+
+    events = [c.args[0] for c in telemetry.submit.call_args_list]
+    by_kind = {e["kind"]: e for e in events}
+    assert set(by_kind) == {"llm", "tool"}
+    assert by_kind["llm"]["runId"] == "e-inv-7"
+    assert by_kind["llm"]["spanId"]
+    assert by_kind["tool"]["runId"] == "e-inv-7"
+    assert by_kind["tool"]["spanId"] == "call-9"
