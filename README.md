@@ -59,7 +59,7 @@ pip install matimo-agdk[all]
    private key is returned by the server exactly once, at registration --
    there is no way to retrieve it again. Losing it means registering fresh,
    or rotating the key if you still hold the identity and the org API key
-   (`matimo rotate-key --name my-agent`).
+   (`matimo-agdk rotate-key --name my-agent`).
 
 2. Build a Governor from the persisted credentials:
 
@@ -199,7 +199,7 @@ next, on two different timescales:
 
 `GatewayConfig` loads with this precedence, highest wins: explicit kwargs
 passed to `Governor(...)` / `Governor.from_env(...)` > environment
-variables > the credentials file written by `matimo register`.
+variables > the credentials file written by `matimo-agdk register`.
 
 | Env var | Purpose |
 |---|---|

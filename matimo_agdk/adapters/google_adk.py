@@ -11,7 +11,7 @@ spelling and uses it consistently, per that report's own instruction to
 whoever built this next. `GatewayConfig.framework`'s `Framework` literal
 already uses the hyphenated form -- register with
 `governor.register(framework="google-adk")` or
-`matimo register --framework google-adk`.
+`matimo-agdk register --framework google-adk`.
 
 Two pieces:
 

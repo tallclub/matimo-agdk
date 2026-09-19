@@ -597,7 +597,7 @@ def scenario_register(ctx: Ctx) -> None:
             )
 
         # Stash the fake home for scenario_doctor, which needs the exact
-        # same registered identity on disk to exercise `matimo doctor`
+        # same registered identity on disk to exercise `matimo-agdk doctor`
         # against a real, already-registered identity. TemporaryDirectory
         # would delete `fake_home` on context exit, so copy it somewhere
         # durable first; scenario_doctor's caller cleans that up.
