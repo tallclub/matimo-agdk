@@ -59,6 +59,7 @@ def test_observe_mode_never_calls_check_tool() -> None:
 
     gov = MagicMock()
     gov.check_tool = MagicMock()
+    gov.check_and_wait = MagicMock()
     gov.tool_span = MagicMock()
 
     tools = govern_tools([_fresh_add_tool()], gov, mode="observe")
@@ -66,6 +67,7 @@ def test_observe_mode_never_calls_check_tool() -> None:
 
     assert result == 3
     gov.check_tool.assert_not_called()
+    gov.check_and_wait.assert_not_called()
     gov.tool_span.assert_called_once()
     assert gov.tool_span.call_args.kwargs["status"] == "completed"
 
@@ -175,12 +177,14 @@ def test_suspended_state_stops_before_tool_call() -> None:
 
     gov = MagicMock()
     gov.check_tool = MagicMock(return_value=ToolDecision(decision="ALLOW"))
+    gov.check_and_wait = MagicMock(return_value=ToolDecision(decision="ALLOW"))
     gov.raise_if_suspended.side_effect = AgentSuspendedLocally("suspended", False)
 
     tools = govern_tools([_fresh_add_tool()], gov, mode="govern")
     with pytest.raises(AgentSuspendedLocally):
         tools[0].invoke({"a": 1, "b": 1})
     gov.check_tool.assert_not_called()
+    gov.check_and_wait.assert_not_called()
 
 
 def test_suspended_state_stops_before_llm_boundary_via_callback() -> None:

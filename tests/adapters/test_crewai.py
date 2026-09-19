@@ -53,11 +53,13 @@ def test_observe_mode_never_calls_check_tool() -> None:
 
     gov = MagicMock()
     gov.check_tool = MagicMock()
+    gov.check_and_wait = MagicMock()
     gov.tool_span = MagicMock()
 
     t = govern_tool(_fresh_tool(), gov, mode="observe")
     assert t.run(x=5) == "ran 5"
     gov.check_tool.assert_not_called()
+    gov.check_and_wait.assert_not_called()
     gov.tool_span.assert_called_once()
     assert gov.tool_span.call_args.kwargs["status"] == "completed"
 
@@ -134,12 +136,14 @@ def test_suspended_state_stops_before_tool_call() -> None:
 
     gov = MagicMock()
     gov.check_tool = MagicMock(return_value=ToolDecision(decision="ALLOW"))
+    gov.check_and_wait = MagicMock(return_value=ToolDecision(decision="ALLOW"))
     gov.raise_if_suspended.side_effect = AgentSuspendedLocally("suspended", False)
 
     t = govern_tool(_fresh_tool(), gov, mode="govern")
     with pytest.raises(AgentSuspendedLocally):
         t.run(x=1)
     gov.check_tool.assert_not_called()
+    gov.check_and_wait.assert_not_called()
 
 
 def test_govern_crew_wraps_every_agent_tool() -> None:
@@ -150,7 +154,7 @@ def test_govern_crew_wraps_every_agent_tool() -> None:
             self.tools = tools
 
     gov = MagicMock()
-    gov.check_tool.return_value = ToolDecision(decision="ALLOW")
+    gov.check_and_wait.return_value = ToolDecision(decision="ALLOW")
     gov.tool_span = MagicMock()
 
     t1, t2 = _fresh_tool(), _fresh_tool()
@@ -159,7 +163,7 @@ def test_govern_crew_wraps_every_agent_tool() -> None:
 
     assert t1.run(x=1) == "ran 1"
     assert t2.run(x=2) == "ran 2"
-    assert gov.check_tool.call_count == 2
+    assert gov.check_and_wait.call_count == 2
 
 
 def test_govern_crew_does_not_double_wrap_a_tool_shared_by_two_agents() -> None:
@@ -170,7 +174,7 @@ def test_govern_crew_does_not_double_wrap_a_tool_shared_by_two_agents() -> None:
             self.tools = tools
 
     gov = MagicMock()
-    gov.check_tool.return_value = ToolDecision(decision="ALLOW")
+    gov.check_and_wait.return_value = ToolDecision(decision="ALLOW")
     gov.tool_span = MagicMock()
 
     shared = _fresh_tool()
@@ -178,7 +182,7 @@ def test_govern_crew_does_not_double_wrap_a_tool_shared_by_two_agents() -> None:
     govern_crew(agents, gov, mode="govern")
 
     shared.run(x=1)
-    assert gov.check_tool.call_count == 1
+    assert gov.check_and_wait.call_count == 1
 
 
 def test_gateway_llm_wires_base_url_and_static_session_header() -> None:

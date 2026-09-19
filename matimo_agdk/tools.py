@@ -32,12 +32,21 @@ IDENTITY_TOKEN_HEADER = "X-Matimo-Agent-Identity-Token"
 
 _MAX_ARG_VALUE_LEN = 2000
 
-# TRD section 4.3's decided polling posture: 2s initial, doubling to a 60s
-# ceiling, with jitter, bounded by the server's own 4-hour approval TTL
+# TRD section 4.3's decided polling posture: 3s initial, doubling to a 60s
+# ceiling, with +/-10% jitter, bounded by the server's own 4-hour approval TTL
 # (docs/SERVER-CONTRACT.md section 8.1).
 DEFAULT_POLL_INTERVAL_SECONDS = 3.0
 DEFAULT_POLL_MAX_INTERVAL_SECONDS = 60.0
 DEFAULT_MAX_WAIT_SECONDS = 4 * 3600.0
+
+# Gateway answers PENDING with *no* resumeToken when an identical check is
+# already in flight (reason "duplicate_check_in_flight"): the caller has
+# nothing to poll. The in-flight check's answer is cached server-side for
+# 15 minutes, so re-sending the same check shortly after returns it (with
+# the token). Re-check after each of these delays; if it is still tokenless
+# after the last one, fail closed rather than run an unapproved tool.
+DEFAULT_RECHECK_DELAYS = (0.5, 1.0, 2.0, 4.0)
+NO_RESUME_TOKEN_DENY_REASON = "tool_check_pending_without_resume_token"
 
 
 def redact_args(args: dict[str, Any]) -> dict[str, Any]:
@@ -75,6 +84,11 @@ class ToolDecision:
     def pending(self) -> bool:
         return self.decision == "PENDING"
 
+    @property
+    def pending_without_token(self) -> bool:
+        """PENDING but nothing to poll -- see DEFAULT_RECHECK_DELAYS."""
+        return self.pending and not self.resume_token
+
 
 def _check_body(
     tool_name: str, args: dict[str, Any] | None, category_hint: str | None, include_args: bool
@@ -110,6 +124,7 @@ class ToolGovernor:
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         poll_max_interval: float = DEFAULT_POLL_MAX_INTERVAL_SECONDS,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
+        recheck_delays: tuple[float, ...] = DEFAULT_RECHECK_DELAYS,
     ) -> None:
         self._http = http
         self._identity_token = identity_token
@@ -119,6 +134,7 @@ class ToolGovernor:
         self.poll_interval = poll_interval
         self.poll_max_interval = poll_max_interval
         self.max_wait_seconds = max_wait_seconds
+        self.recheck_delays = recheck_delays
 
     def _headers(self) -> dict[str, str]:
         return {IDENTITY_TOKEN_HEADER: self._identity_token}
@@ -130,6 +146,31 @@ class ToolGovernor:
             tenant_id=self._tenant_id,
             external_framework=self._external_framework,
         )
+
+    def check_and_wait(
+        self,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        category_hint: str | None = None,
+    ) -> ToolDecision:
+        """check(), then whatever it takes to reach a final ALLOW or DENY.
+
+        PENDING with a resume token is polled to a decision. PENDING with no
+        token is re-checked (see DEFAULT_RECHECK_DELAYS) and, if it never
+        yields one, becomes a DENY -- never a PENDING the caller might treat
+        as "not denied" and run the tool on."""
+        decision = self.check(tool_name, args, category_hint=category_hint)
+        for delay in self.recheck_delays:
+            if not decision.pending_without_token:
+                break
+            time.sleep(delay * random.uniform(0.9, 1.1))
+            decision = self.check(tool_name, args, category_hint=category_hint)
+        if decision.pending_without_token:
+            return ToolDecision(decision="DENY", reason=NO_RESUME_TOKEN_DENY_REASON)
+        if decision.pending and decision.resume_token:
+            return self.await_decision(decision.resume_token)
+        return decision
 
     def check(
         self,
@@ -165,7 +206,7 @@ class ToolGovernor:
         poll_interval: float | None = None,
         max_wait_seconds: float | None = None,
     ) -> ToolDecision:
-        """Blocking poll with decorrelated-jitter exponential backoff."""
+        """Blocking poll with exponential backoff and +/-10% jitter."""
         interval = poll_interval if poll_interval is not None else self.poll_interval
         budget = max_wait_seconds if max_wait_seconds is not None else self.max_wait_seconds
         deadline = time.monotonic() + budget
@@ -231,6 +272,7 @@ class AsyncToolGovernor:
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         poll_max_interval: float = DEFAULT_POLL_MAX_INTERVAL_SECONDS,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
+        recheck_delays: tuple[float, ...] = DEFAULT_RECHECK_DELAYS,
     ) -> None:
         self._http = http
         self._identity_token = identity_token
@@ -240,6 +282,7 @@ class AsyncToolGovernor:
         self.poll_interval = poll_interval
         self.poll_max_interval = poll_max_interval
         self.max_wait_seconds = max_wait_seconds
+        self.recheck_delays = recheck_delays
 
     def _headers(self) -> dict[str, str]:
         return {IDENTITY_TOKEN_HEADER: self._identity_token}
@@ -251,6 +294,26 @@ class AsyncToolGovernor:
             tenant_id=self._tenant_id,
             external_framework=self._external_framework,
         )
+
+    async def check_and_wait(
+        self,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        category_hint: str | None = None,
+    ) -> ToolDecision:
+        """Async twin of ToolGovernor.check_and_wait()."""
+        decision = await self.check(tool_name, args, category_hint=category_hint)
+        for delay in self.recheck_delays:
+            if not decision.pending_without_token:
+                break
+            await asyncio.sleep(delay * random.uniform(0.9, 1.1))
+            decision = await self.check(tool_name, args, category_hint=category_hint)
+        if decision.pending_without_token:
+            return ToolDecision(decision="DENY", reason=NO_RESUME_TOKEN_DENY_REASON)
+        if decision.pending and decision.resume_token:
+            return await self.await_decision(decision.resume_token)
+        return decision
 
     async def check(
         self,
