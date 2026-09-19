@@ -315,6 +315,35 @@ class Governor:
         if self._telemetry is not None:
             self._telemetry.submit(event)
 
+    def run_span(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        name: str = "agent-run",
+        started_at: str | None = None,
+        duration_ms: int | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Emits a `kind:"run"` span for a run the framework owns (ADK's
+        invocation id), for adapters that cannot wrap the run in
+        `governor.run()`. `status="running"` opens it; a terminal status
+        (`completed`/`failed`/`cancelled`) is the only thing that ends it
+        server-side -- see docs/SERVER-CONTRACT.md section 7.3."""
+        if started_at is None and status == "running":
+            started_at = _now_iso()
+        self._emit(
+            run_span(
+                run_id,
+                name=name,
+                status=status,
+                session_id=run_id,
+                started_at=started_at,
+                duration_ms=duration_ms,
+                attributes=attributes,
+            )
+        )
+
     def llm_span(self, **kwargs: Any) -> None:
         run_id = kwargs.pop("run_id", None) or _current_run.get()
         if run_id is None:
@@ -749,6 +778,35 @@ class AsyncGovernor:
     def _emit(self, event: dict[str, Any]) -> None:
         if self._telemetry is not None:
             self._telemetry.submit(event)
+
+    def run_span(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        name: str = "agent-run",
+        started_at: str | None = None,
+        duration_ms: int | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Emits a `kind:"run"` span for a run the framework owns (ADK's
+        invocation id), for adapters that cannot wrap the run in
+        `governor.run()`. `status="running"` opens it; a terminal status
+        (`completed`/`failed`/`cancelled`) is the only thing that ends it
+        server-side -- see docs/SERVER-CONTRACT.md section 7.3."""
+        if started_at is None and status == "running":
+            started_at = _now_iso()
+        self._emit(
+            run_span(
+                run_id,
+                name=name,
+                status=status,
+                session_id=run_id,
+                started_at=started_at,
+                duration_ms=duration_ms,
+                attributes=attributes,
+            )
+        )
 
     def llm_span(self, **kwargs: Any) -> None:
         run_id = kwargs.pop("run_id", None) or _current_run.get()

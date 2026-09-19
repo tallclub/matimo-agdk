@@ -65,6 +65,16 @@ Every span's `run_id` is the ADK invocation's own `invocation_id`
 (`callback_context.invocation_id`/`tool_context.invocation_id`), so LLM
 and tool spans for one agent turn correlate automatically without the
 caller wrapping anything in `governor.run()`.
+
+## Run lifecycle
+
+`before_run_callback` opens the run (`kind:"run"`, `status="running"`);
+`after_run_callback` closes it `completed` and `on_run_error_callback`
+closes it `failed`. Gateway only ends a run on an explicit terminal run
+span (docs/SERVER-CONTRACT.md section 7.3), so without these the run stays
+`running` until the staleness sweep. ADK skips `after_run_callback` when the
+caller abandons the event stream early (e.g. `break` out of
+`runner.run_async`); such a run also falls back to the staleness sweep.
 """
 
 from __future__ import annotations
@@ -121,10 +131,54 @@ class MatimoPlugin(BasePlugin):  # type: ignore[misc]
         self._pending_llm: dict[str, tuple[str, float, str | None]] = {}
         self._previous_run: dict[str, str | None] = {}
         self._pending_tool: dict[str, tuple[float, str | None]] = {}
+        self._open_runs: dict[str, tuple[str, float]] = {}
 
     def _restore_run(self, invocation_id: str) -> None:
         if invocation_id in self._previous_run:
             self.governor.bind_run_id(self._previous_run.pop(invocation_id))
+
+    # -- run lifecycle ------------------------------------------------------
+
+    def _close_run(self, invocation_id: str, status: str) -> None:
+        opened = self._open_runs.pop(invocation_id, None)
+        if opened is None:
+            return
+        name, started = opened
+        try:
+            self.governor.run_span(
+                invocation_id,
+                status=status,
+                name=name,
+                duration_ms=int((_now() - started) * 1000),
+            )
+        except Exception:  # noqa: BLE001 -- telemetry must never break the caller's agent
+            pass
+
+    async def before_run_callback(self, *, invocation_context: Any) -> Any:
+        # ADK owns the run, so there is no `governor.run()` block to open and
+        # close it. Without an explicit terminal `kind:"run"` span Gateway
+        # leaves the run `running` until the staleness sweep (contract 7.3).
+        invocation_id = getattr(invocation_context, "invocation_id", None)
+        if not invocation_id:
+            return None
+        agent_name = getattr(getattr(invocation_context, "agent", None), "name", None)
+        name = str(agent_name) if agent_name else "adk-run"
+        self._open_runs[invocation_id] = (name, _now())
+        try:
+            self.governor.run_span(invocation_id, status="running", name=name)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    async def after_run_callback(self, *, invocation_context: Any) -> None:
+        invocation_id = getattr(invocation_context, "invocation_id", None)
+        if invocation_id:
+            self._close_run(invocation_id, "completed")
+
+    async def on_run_error_callback(self, *, invocation_context: Any, error: Exception) -> None:
+        invocation_id = getattr(invocation_context, "invocation_id", None)
+        if invocation_id:
+            self._close_run(invocation_id, "failed")
 
     # -- model callbacks --------------------------------------------------
 

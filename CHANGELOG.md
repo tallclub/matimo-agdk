@@ -6,6 +6,26 @@ All notable changes to this project are documented in this file.
 
 Initial core SDK build. Not yet published to PyPI.
 
+### Fixed (2026-09-19, Google ADK runs stayed `running` in Gateway Observability)
+
+- `MatimoPlugin` never emitted a `kind:"run"` span, and Gateway only ends a
+  run on an explicit terminal run span (SERVER-CONTRACT section 7.3), so every
+  ADK run stayed `running` until the staleness sweep. The plugin now opens the
+  run in `before_run_callback` and closes it `completed` (`after_run_callback`)
+  or `failed` (`on_run_error_callback`), keyed by ADK's invocation id. A run
+  whose event stream the caller abandons early still falls back to the sweep,
+  because ADK skips `after_run_callback` in that case.
+- Added public `Governor.run_span()` / `AsyncGovernor.run_span()` for adapters
+  whose framework owns the run and cannot use `governor.run()`.
+- Every ADK and LangChain `llm` and `tool` span was silently dropped:
+  the adapters pass `span_id` (and LangChain `parent_span_id`), but
+  `telemetry.llm_span()` / `tool_span()` did not accept them, so each call
+  raised a `TypeError` that the adapters' never-break-the-agent handler
+  swallowed. Both builders now forward `span_id` / `parent_span_id`. The
+  existing tests used a `MagicMock` governor, which accepts any kwargs, so
+  they could not see it; new regression tests run the real builders. CrewAI,
+  AutoGen and the generic adapter were audited and were not affected.
+
 ### Changed (2026-09-19, Python floor)
 
 - `requires-python` raised from 3.11 to 3.13; classifiers list 3.13 and 3.14.
