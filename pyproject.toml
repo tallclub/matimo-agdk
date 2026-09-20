@@ -99,3 +99,8 @@ warn_unused_ignores = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = [
+    # The suite talks to http://testserver; the cleartext-credentials warning is
+    # covered by its own test, which asserts it explicitly.
+    "ignore:base_url .* is plain http:UserWarning",
+]

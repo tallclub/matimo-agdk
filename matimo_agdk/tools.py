@@ -21,8 +21,9 @@ import random
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import quote
 
-from ._redact import redact
+from ._redact import redact, scrub_string
 from .exceptions import GatewayError, ToolCheckTimeout
 from .transport import AsyncGatewayHTTP, GatewayHTTP
 
@@ -123,6 +124,25 @@ def _decision_from(data: dict[str, Any]) -> ToolDecision:
     )
 
 
+def _report_body(
+    resume_token: str, status: str, duration_ms: int | None, error: str | None
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"resumeToken": resume_token, "status": status}
+    if duration_ms is not None:
+        body["durationMs"] = duration_ms
+    if error is not None:
+        # Exception messages routinely carry connection strings and tokens.
+        body["error"] = scrub_string(error)[:2000]
+    return body
+
+
+def _category_path(tool_name: str) -> str:
+    # Percent-encode everything, "/" and "." segments included: an unquoted tool
+    # name such as "../identities/x" would otherwise be normalised by the HTTP
+    # client into a different route, sent with the org API key.
+    return f"/tools/{quote(tool_name, safe='')}/category"
+
+
 class ToolGovernor:
     """Synchronous tool-check client."""
 
@@ -213,6 +233,7 @@ class ToolGovernor:
             "/tools/check",
             json_body=_check_body(tool_name, args, category_hint, include_args),
             headers=self._headers(),
+            idempotent=True,
             **self._sign_kwargs(),
         )
         return _decision_from(resp.data or {})
@@ -223,6 +244,7 @@ class ToolGovernor:
             "/tools/check/status",
             json_body={"resumeToken": resume_token},
             headers=self._headers(),
+            idempotent=True,
             **self._sign_kwargs(),
         )
         return _decision_from(resp.data or {})
@@ -260,11 +282,7 @@ class ToolGovernor:
     ) -> None:
         """Fire-and-forget: persists nothing queryable server-side today
         (docs/SERVER-CONTRACT.md section 8.3). Swallows GatewayError."""
-        body: dict[str, Any] = {"resumeToken": resume_token, "status": status}
-        if duration_ms is not None:
-            body["durationMs"] = duration_ms
-        if error is not None:
-            body["error"] = error[:2000]
+        body = _report_body(resume_token, status, duration_ms, error)
         try:
             self._http.request(
                 "POST",
@@ -280,7 +298,7 @@ class ToolGovernor:
         """Tenant-wide admin action, identity:manage scoped, unsigned."""
         self._http.request(
             "PUT",
-            f"/tools/{tool_name}/category",
+            _category_path(tool_name),
             json_body={"category": category},
             sign=False,
         )
@@ -371,6 +389,7 @@ class AsyncToolGovernor:
             "/tools/check",
             json_body=_check_body(tool_name, args, category_hint, include_args),
             headers=self._headers(),
+            idempotent=True,
             **self._sign_kwargs(),
         )
         return _decision_from(resp.data or {})
@@ -381,6 +400,7 @@ class AsyncToolGovernor:
             "/tools/check/status",
             json_body={"resumeToken": resume_token},
             headers=self._headers(),
+            idempotent=True,
             **self._sign_kwargs(),
         )
         return _decision_from(resp.data or {})
@@ -415,11 +435,7 @@ class AsyncToolGovernor:
         duration_ms: int | None = None,
         error: str | None = None,
     ) -> None:
-        body: dict[str, Any] = {"resumeToken": resume_token, "status": status}
-        if duration_ms is not None:
-            body["durationMs"] = duration_ms
-        if error is not None:
-            body["error"] = error[:2000]
+        body = _report_body(resume_token, status, duration_ms, error)
         try:
             await self._http.request(
                 "POST",
@@ -434,7 +450,7 @@ class AsyncToolGovernor:
     async def set_category(self, tool_name: str, category: str) -> None:
         await self._http.request(
             "PUT",
-            f"/tools/{tool_name}/category",
+            _category_path(tool_name),
             json_body={"category": category},
             sign=False,
         )
