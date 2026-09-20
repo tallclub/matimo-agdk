@@ -48,6 +48,12 @@ DEFAULT_MAX_WAIT_SECONDS = 4 * 3600.0
 DEFAULT_RECHECK_DELAYS = (0.5, 1.0, 2.0, 4.0)
 NO_RESUME_TOKEN_DENY_REASON = "tool_check_pending_without_resume_token"
 
+# The contract's decision enum is exactly ALLOW | DENY | PENDING. Anything else
+# (server drift, a proxy rewriting the body, a missing field) is treated as a DENY:
+# a governance check that cannot be understood must never let the tool run.
+UNRECOGNIZED_DECISION_DENY_REASON = "unrecognized_tool_check_decision"
+_VALID_DECISIONS = frozenset({"ALLOW", "DENY", "PENDING"})
+
 
 def redact_args(args: dict[str, Any]) -> dict[str, Any]:
     """Recursive key-based redaction of a tool's arguments before they are
@@ -102,8 +108,15 @@ def _check_body(
 
 
 def _decision_from(data: dict[str, Any]) -> ToolDecision:
+    decision = data.get("decision")
+    if decision not in _VALID_DECISIONS:
+        return ToolDecision(
+            decision="DENY",
+            reason=UNRECOGNIZED_DECISION_DENY_REASON,
+            request_id=data.get("requestId"),
+        )
     return ToolDecision(
-        decision=data["decision"],
+        decision=decision,
         reason=data.get("reason"),
         resume_token=data.get("resumeToken"),
         request_id=data.get("requestId"),
