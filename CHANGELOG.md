@@ -58,6 +58,35 @@ Tool spans:
 Documented, not changed: CrewAI and AutoGen cannot group a crew or chat into one run
 automatically, so `governor.run()` is the grouping mechanism.
 
+### Added and fixed (2026-09-20, contract test against a machine-readable /v1 spec)
+
+- **`tests/contract/`** (BUILD-PLAN D16): an OpenAPI 3.1 description of the `/v1`
+  routes the SDK calls, derived by hand from the server's Zod schemas
+  (`gateway.ts`) and `docs/SERVER-CONTRACT.md`, plus response fixtures (derived, not
+  recorded live). Tests assert every request the SDK builds conforms (body, required
+  headers, path parameters, sync and async) and every fixture parses. `jsonschema`
+  joins the dev dependencies.
+- Where the doc and the code disagree, the spec follows the code:
+  `SERVER-CONTRACT.md` still says 1 to 500 telemetry events and four registration
+  frameworks; the code allows 0 to 500 (a pure heartbeat) and six.
+- **Fixed: a non-JSON tool argument or result broke the agent.** A `datetime`,
+  `Path`, `UUID`, `set`, arbitrary object or `NaN` in a tool's arguments made
+  `serialize_json` raise `TypeError`: `guard()` and every adapter failed before the
+  tool ran, and in telemetry the same batch was re-queued forever, silently stopping
+  all reporting and heartbeats behind it. Redaction now sends such a value as its
+  text (ISO for dates, `"nan"` for non-finite floats).
+- **Fixed: one over-long field lost a whole batch.** The server validates a batch as
+  one unit, so a single event with a `name` over 255 characters, an id over 120, a
+  `status` over 20, or a non-integer or negative `durationMs` got a 400 for all of
+  its neighbours, and the exporter then dropped the batch. `build_event()` now clamps
+  each to the server's limit.
+- **Fixed: `telemetry_batch_size` could exceed the server's 500-event cap** (any
+  larger value produced batches the server rejects whole). It is now capped at 500 at
+  config load.
+- Not changed, noted: `toolName` over 255 and a `category` hint over 50 characters
+  still produce a 400 from Gateway (the SDK cannot shorten a name it must send
+  verbatim).
+
 ### Fixed (2026-09-20, end-to-end review; every item reproduced by script first)
 
 Governance and correctness:

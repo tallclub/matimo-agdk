@@ -330,6 +330,18 @@ handles every scripted response shape correctly -- signing, retries,
 redaction, adapter wiring -- without needing Gateway, Postgres, or a license.
 This is the check to run on every change, and the one CI runs.
 
+`tests/contract/` holds the contract test: an OpenAPI 3.1 description of the `/v1`
+routes the SDK calls (`gateway-v1.openapi.json`), plus recorded-shape response
+fixtures. The tests drive the real SDK and assert that every request it builds
+(body, required headers, path parameters) satisfies the spec, that every fixture
+does too and is parsed into the right result or typed error, and that the SDK
+cannot build a request the server would reject (over-long fields, a batch over
+500 events, values that are not JSON). The spec and fixtures are derived by hand
+from the server's Zod schemas, not generated or recorded from a live Gateway:
+they are only as current as their last review against `gateway.ts`. The
+canonical, published spec (BUILD-PLAN D16) is a Universal-AgentForge follow-up;
+when it exists it should replace this file.
+
 ### 2. CLI sanity check -- a real Gateway, no code
 
 Once a local Matimo Gateway is reachable (part of the Matimo Workbench
