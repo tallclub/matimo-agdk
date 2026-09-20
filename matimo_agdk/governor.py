@@ -26,6 +26,7 @@ from typing import Any, TypeVar
 
 import httpx
 
+from ._compat import sdk_requires_httpx2
 from ._retry_transport import AsyncSessionRetryTransport, SessionRetryTransport
 from .config import GatewayConfig
 from .exceptions import GatewayError, ToolDenied
@@ -59,6 +60,17 @@ def current_run_id() -> str | None:
 
 
 REGISTER_PATH = "/identities"
+
+
+_HTTPX2_HINT = (
+    "This client needs the `httpx2` package (the HTTP library newer LLM SDKs such as "
+    "anthropic >= 1.6 are built on). It is installed with those SDKs; otherwise "
+    "`pip install httpx2`."
+)
+
+
+def _bind_hint(exc: ImportError) -> ImportError:
+    return ImportError(f"{_HTTPX2_HINT} ({exc})")
 
 
 def _now_iso() -> str:
@@ -474,11 +486,12 @@ class Governor:
         outgoing request, computed over the exact bytes httpx is about to
         send.
 
-        Point any OpenAI/Anthropic SDK's `http_client=` at this. A plain
+        Point an OpenAI SDK's `http_client=` at this. A plain
         `default_headers=` cannot carry a per-request signature (the
         signature must cover each request's own body bytes) -- this
         client, via its request event hook, is the mechanism that makes
-        that possible.
+        that possible. For the Anthropic SDK use `anthropic_http_client()`:
+        anthropic >= 1.6 is built on `httpx2` and rejects an `httpx.Client`.
 
         Also transparently re-handshakes exactly once on a live 401
         session_expired (e.g. another process called DELETE /v1/sessions,
@@ -486,13 +499,67 @@ class Governor:
         process's back) -- found missing entirely during live verification
         against a real Gateway; see SessionRetryTransport's docstring.
         """
+        session, signer = self._bound()
+        transport = SessionRetryTransport(
+            httpx.HTTPTransport(),
+            session,
+            signer,
+            signing_enabled=self.config.signing_enabled,
+        )
+        return httpx.Client(
+            base_url=self.config.base_url,
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            event_hooks={"request": [self._request_hook()]},
+            transport=transport,
+            timeout=self.config.http_timeout(),
+        )
+
+    def httpx2_client(self) -> Any:
+        """`httpx_client()` for SDKs built on `httpx2` (anthropic >= 1.6): the
+        same live session token, per-request signature and transparent
+        re-handshake, as an `httpx2.Client`. Needs the `httpx2` package."""
+        try:
+            from ._retry_transport_httpx2 import Httpx2SessionRetryTransport, httpx2
+        except ImportError as exc:
+            raise _bind_hint(exc) from exc
+        session, signer = self._bound()
+        transport = Httpx2SessionRetryTransport(
+            httpx2.HTTPTransport(),
+            session,
+            signer,
+            signing_enabled=self.config.signing_enabled,
+        )
+        return httpx2.Client(
+            base_url=self.config.base_url,
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            event_hooks={"request": [self._request_hook()]},
+            transport=transport,
+            timeout=self.config.http_timeout(httpx2),
+        )
+
+    def anthropic_http_client(self) -> Any:
+        """The right `http_client=` for `anthropic.Anthropic(...)`, whichever
+        HTTP library the installed anthropic release uses::
+
+            client = anthropic.Anthropic(
+                **governor.anthropic_client_kwargs(),
+                http_client=governor.anthropic_http_client(),
+            )
+        """
+        return self.httpx2_client() if sdk_requires_httpx2("anthropic") else self.httpx_client()
+
+    def _bound(self) -> tuple[SessionManager, JWSSigner]:
         if self._session is None or self._identity is None or self._signer is None:
             raise GatewayError("Governor has no bound identity")
-        session = self._session
-        signer = self._signer
+        return self._session, self._signer
+
+    def _request_hook(self) -> Callable[[Any], None]:
+        """The per-request hook shared by every client this governor builds
+        (library-agnostic: it only touches `request.headers`/`.content`)."""
+        session, signer = self._bound()
         config = self.config
 
-        def _hook(request: httpx.Request) -> None:
+        def _hook(request: Any) -> None:
             request.headers[SESSION_TOKEN_HEADER] = session.get_token()
             run_id = _current_run.get()
             if run_id:
@@ -501,20 +568,7 @@ class Governor:
                 jws = signer.sign_request(body_bytes=request.content or b"")
                 request.headers["Matimo-Agent-Signature"] = jws
 
-        transport = SessionRetryTransport(
-            httpx.HTTPTransport(),
-            session,
-            signer,
-            signing_enabled=config.signing_enabled,
-        )
-
-        return httpx.Client(
-            base_url=self.config.base_url,
-            headers={"Authorization": f"Bearer {self.config.api_key}"},
-            event_hooks={"request": [_hook]},
-            transport=transport,
-            timeout=self.config.http_timeout(),
-        )
+        return _hook
 
     def openai_client_kwargs(self) -> dict[str, Any]:
         """kwargs for `openai.OpenAI(**governor.openai_client_kwargs())`.
@@ -533,7 +587,8 @@ class Governor:
 
     def anthropic_client_kwargs(self) -> dict[str, Any]:
         """kwargs for `anthropic.Anthropic(**governor.anthropic_client_kwargs())`.
-        Same signing caveat as openai_client_kwargs().
+        Same signing caveat as openai_client_kwargs(): also pass
+        `http_client=governor.anthropic_http_client()` for a live, signed client.
 
         Uses `auth_token`, not `api_key`: the Anthropic SDK sends `api_key`
         as `x-api-key`, which Gateway does not read; `auth_token` is sent
@@ -914,13 +969,62 @@ class AsyncGovernor:
     def httpx_async_client(self) -> httpx.AsyncClient:
         """Async twin of Governor.httpx_client(), including the same
         transparent re-handshake-on-401-session_expired behavior."""
+        session, signer = self._bound()
+        transport = AsyncSessionRetryTransport(
+            httpx.AsyncHTTPTransport(),
+            session,
+            signer,
+            signing_enabled=self.config.signing_enabled,
+        )
+        return httpx.AsyncClient(
+            base_url=self.config.base_url,
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            event_hooks={"request": [self._request_hook()]},
+            transport=transport,
+            timeout=self.config.http_timeout(),
+        )
+
+    def httpx2_async_client(self) -> Any:
+        """Async twin of Governor.httpx2_client(): an `httpx2.AsyncClient` for
+        SDKs built on `httpx2` (anthropic >= 1.6). Needs the `httpx2` package."""
+        try:
+            from ._retry_transport_httpx2 import Httpx2AsyncSessionRetryTransport, httpx2
+        except ImportError as exc:
+            raise _bind_hint(exc) from exc
+        session, signer = self._bound()
+        transport = Httpx2AsyncSessionRetryTransport(
+            httpx2.AsyncHTTPTransport(),
+            session,
+            signer,
+            signing_enabled=self.config.signing_enabled,
+        )
+        return httpx2.AsyncClient(
+            base_url=self.config.base_url,
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            event_hooks={"request": [self._request_hook()]},
+            transport=transport,
+            timeout=self.config.http_timeout(httpx2),
+        )
+
+    def anthropic_http_client(self) -> Any:
+        """The right `http_client=` for `anthropic.AsyncAnthropic(...)`,
+        whichever HTTP library the installed anthropic release uses."""
+        return (
+            self.httpx2_async_client()
+            if sdk_requires_httpx2("anthropic")
+            else self.httpx_async_client()
+        )
+
+    def _bound(self) -> tuple[AsyncSessionManager, JWSSigner]:
         if self._session is None or self._identity is None or self._signer is None:
             raise GatewayError("Governor has no bound identity")
-        session = self._session
-        signer = self._signer
+        return self._session, self._signer
+
+    def _request_hook(self) -> Callable[[Any], Awaitable[None]]:
+        session, signer = self._bound()
         config = self.config
 
-        async def _hook(request: httpx.Request) -> None:
+        async def _hook(request: Any) -> None:
             request.headers[SESSION_TOKEN_HEADER] = await session.get_token()
             run_id = _current_run.get()
             if run_id:
@@ -929,20 +1033,7 @@ class AsyncGovernor:
                 jws = signer.sign_request(body_bytes=request.content or b"")
                 request.headers["Matimo-Agent-Signature"] = jws
 
-        transport = AsyncSessionRetryTransport(
-            httpx.AsyncHTTPTransport(),
-            session,
-            signer,
-            signing_enabled=config.signing_enabled,
-        )
-
-        return httpx.AsyncClient(
-            base_url=self.config.base_url,
-            headers={"Authorization": f"Bearer {self.config.api_key}"},
-            event_hooks={"request": [_hook]},
-            transport=transport,
-            timeout=self.config.http_timeout(),
-        )
+        return _hook
 
     async def openai_client_kwargs(self) -> dict[str, Any]:
         return {

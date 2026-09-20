@@ -56,10 +56,12 @@ class GatewayConfig(BaseModel):
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/") or v
 
-    def http_timeout(self) -> httpx.Timeout:
+    def http_timeout(self, library: Any = httpx) -> Any:
         """connect_timeout for connection setup and pool waits,
-        read_timeout for reads and writes."""
-        return httpx.Timeout(
+        read_timeout for reads and writes. `library` is the HTTP module the
+        timeout is for (`httpx` by default, or `httpx2`): the two libraries'
+        `Timeout` classes are unrelated."""
+        return library.Timeout(
             self.read_timeout, connect=self.connect_timeout, pool=self.connect_timeout
         )
 
