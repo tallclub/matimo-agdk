@@ -20,6 +20,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .identity import load_credentials
 
 Framework = Literal["langchain", "google-adk", "crewai", "autogen", "custom"]
+ToolCheckFailureMode = Literal["fail_closed", "fail_open_bounded"]
+
+# BUILD-PLAN D19: a fail-open posture never rides on state more than 5 minutes
+# old, however the customer configures it.
+MAX_FAIL_OPEN_STALE_SECONDS = 300.0
 
 DEFAULT_BASE_URL = "http://localhost:8000/v1"
 
@@ -56,12 +61,40 @@ class GatewayConfig(BaseModel):
     fail_open_telemetry: bool = True
     signing_enabled: bool = True
 
+    # What a tool call does when Gateway cannot answer its check at all (a
+    # connection error, timeout or 5xx; never a 4xx and never a DENY). See
+    # matimo_agdk._outage. fail_closed is the safe default.
+    tool_check_failure_mode: ToolCheckFailureMode = "fail_closed"
+    # fail_open_bounded only lets a call through if Gateway was last heard
+    # from (a successful check or a telemetry heartbeat) within this many
+    # seconds. Hard-capped at BUILD-PLAN D19's 5 minutes.
+    fail_open_max_stale_seconds: float = Field(default=MAX_FAIL_OPEN_STALE_SECONDS, gt=0)
+    # Circuit breaker: after this many consecutive transport-level check
+    # failures the SDK stops trying for `tool_check_breaker_cooldown` seconds.
+    tool_check_breaker_threshold: int = Field(default=3, ge=1)
+    tool_check_breaker_cooldown: float = Field(default=30.0, gt=0)
+
+    # Send each tool's result (redacted, truncated to 500 characters) on its
+    # tool span. Off by default: a result can hold anything the tool read.
+    capture_tool_results: bool = False
+
     credentials_dir: Path | None = None
 
     @field_validator("base_url")
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/") or v
+
+    @field_validator("fail_open_max_stale_seconds")
+    @classmethod
+    def _cap_fail_open_staleness(cls, v: float) -> float:
+        if v > MAX_FAIL_OPEN_STALE_SECONDS:
+            raise ValueError(
+                f"fail_open_max_stale_seconds is hard-capped at {MAX_FAIL_OPEN_STALE_SECONDS:g} "
+                f"(5 minutes), got {v:g}: a fail-open tool check must never rest on "
+                "older Gateway state than that"
+            )
+        return v
 
     @model_validator(mode="after")
     def _warn_on_cleartext_credentials(self) -> GatewayConfig:
@@ -158,6 +191,10 @@ class GatewayConfig(BaseModel):
             values["agent_name"] = env["MATIMO_AGENT_NAME"]
         if env.get("MATIMO_FRAMEWORK"):
             values["framework"] = env["MATIMO_FRAMEWORK"]
+        if env.get("MATIMO_TOOL_CHECK_FAILURE_MODE"):
+            values["tool_check_failure_mode"] = env["MATIMO_TOOL_CHECK_FAILURE_MODE"]
+        if env.get("MATIMO_FAIL_OPEN_MAX_STALE_SECONDS"):
+            values["fail_open_max_stale_seconds"] = env["MATIMO_FAIL_OPEN_MAX_STALE_SECONDS"]
 
         # 3. Explicit kwargs (highest precedence).
         if agent_name is not None:
