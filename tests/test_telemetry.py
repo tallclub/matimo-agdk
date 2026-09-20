@@ -45,10 +45,11 @@ class FakeHTTP:
 
 class FakeSessionManager:
     """Mirrors the real SessionManager.call_with_retry() contract closely
-    enough to prove _flush() actually goes through it now (the 2026-09-18 live verification (CHANGELOG.md)
-    found this call site previously bypassed call_with_retry() entirely,
-    calling get_token() directly -- a session invalidated behind the SDK's
-    back was then silently unrecoverable via telemetry)."""
+    enough to prove _flush() actually goes through it now (the 2026-09-18
+    live verification, see CHANGELOG.md, found this call site previously
+    bypassed call_with_retry() entirely, calling get_token() directly -- a
+    session invalidated behind the SDK's back was then silently
+    unrecoverable via telemetry)."""
 
     def __init__(self, token: str = "tok") -> None:
         self.token = token
@@ -262,8 +263,9 @@ def test_fail_closed_raises_on_gateway_error() -> None:
 
 def test_flush_reauthenticates_once_on_session_expired_then_succeeds() -> None:
     """Regression test for a real bug found live-verifying against Gateway
-    (2026-09-18 live verification, see CHANGELOG.md): _flush() used to call session_manager.get_token()
-    directly, so a session invalidated behind the SDK's back (e.g. another
+    (2026-09-18 live verification, see CHANGELOG.md): _flush() used to call
+    session_manager.get_token() directly, so a session invalidated behind the
+    SDK's back (e.g. another
     process calling DELETE /v1/sessions) produced an infinite loop of
     SessionExpired -> re-queue -> SessionExpired again, since nothing ever
     told the SessionManager to drop its stale cached token. Routing through

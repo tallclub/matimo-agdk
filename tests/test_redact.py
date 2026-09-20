@@ -10,7 +10,9 @@ from matimo_agdk.tools import redact_args
 
 
 def test_nested_secret_inside_arguments_is_masked() -> None:
-    out = redact_args({"query": "x", "credentials": {"password": "hunter2"}, "nested": {"a": {"apiKey": "k"}}})
+    out = redact_args(
+        {"query": "x", "credentials": {"password": "hunter2"}, "nested": {"a": {"apiKey": "k"}}}
+    )
     assert out["credentials"] == REDACTED
     assert out["nested"]["a"]["apiKey"] == REDACTED
     assert out["query"] == "x"
