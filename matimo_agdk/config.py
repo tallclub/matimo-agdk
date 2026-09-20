@@ -9,11 +9,13 @@ talks to the network -- it is pure local state assembly.
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .identity import load_credentials
 
@@ -21,30 +23,35 @@ Framework = Literal["langchain", "google-adk", "crewai", "autogen", "custom"]
 
 DEFAULT_BASE_URL = "http://localhost:8000/v1"
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
 
 class GatewayConfig(BaseModel):
     """Configuration for one Governor instance."""
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    # extra="forbid": a misspelled option (`telemetry_batchsize=10`) must fail
+    # loudly, not be silently ignored while the default stays in force.
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     base_url: str = DEFAULT_BASE_URL
-    api_key: str = ""
-    identity_token: str | None = None
+    # repr=False on both secrets: a config object is routinely logged.
+    api_key: str = Field(default="", repr=False)
+    identity_token: str | None = Field(default=None, repr=False)
     identity_id: str | None = None
     tenant_id: str | None = None
-    private_key_pem: str | None = None
+    private_key_pem: str | None = Field(default=None, repr=False)
     agent_name: str = "matimo-agent"
     framework: Framework = "custom"
 
-    connect_timeout: float = 10.0
-    read_timeout: float = 30.0
+    connect_timeout: float = Field(default=10.0, gt=0)
+    read_timeout: float = Field(default=30.0, gt=0)
 
-    telemetry_flush_interval: float = 5.0
-    telemetry_batch_size: int = 50
-    telemetry_queue_max: int = 2000
+    telemetry_flush_interval: float = Field(default=5.0, gt=0)
+    telemetry_batch_size: int = Field(default=50, ge=1)
+    telemetry_queue_max: int = Field(default=2000, ge=1)
     # None means "compute from the server-reported staleness window at
     # runtime" -- see resolved_heartbeat_interval().
-    heartbeat_interval: float | None = None
+    heartbeat_interval: float | None = Field(default=None, gt=0)
 
     fail_open_telemetry: bool = True
     signing_enabled: bool = True
@@ -55,6 +62,18 @@ class GatewayConfig(BaseModel):
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/") or v
+
+    @model_validator(mode="after")
+    def _warn_on_cleartext_credentials(self) -> GatewayConfig:
+        parts = urlsplit(self.base_url)
+        if self.api_key and parts.scheme == "http" and parts.hostname not in _LOOPBACK_HOSTS:
+            warnings.warn(
+                f"base_url {self.base_url!r} is plain http: the org API key and session "
+                "tokens would cross the network unencrypted. Use https outside a trusted "
+                "network.",
+                stacklevel=2,
+            )
+        return self
 
     def http_timeout(self, library: Any = httpx) -> Any:
         """connect_timeout for connection setup and pool waits,
@@ -126,10 +145,15 @@ class GatewayConfig(BaseModel):
         if env.get("MATIMO_PRIVATE_KEY"):
             values["private_key_pem"] = env["MATIMO_PRIVATE_KEY"]
         elif env.get("MATIMO_PRIVATE_KEY_FILE"):
+            key_file = env["MATIMO_PRIVATE_KEY_FILE"]
             try:
-                values["private_key_pem"] = Path(env["MATIMO_PRIVATE_KEY_FILE"]).read_text()
-            except OSError:
-                pass
+                values["private_key_pem"] = Path(key_file).read_text(encoding="utf-8")
+            except OSError as exc:
+                # Fail here, with the path, rather than later as an opaque
+                # "Governor has no identity".
+                raise ValueError(
+                    f"MATIMO_PRIVATE_KEY_FILE={key_file!r} is unreadable: {exc}"
+                ) from exc
         if env.get("MATIMO_AGENT_NAME"):
             values["agent_name"] = env["MATIMO_AGENT_NAME"]
         if env.get("MATIMO_FRAMEWORK"):

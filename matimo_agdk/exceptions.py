@@ -131,6 +131,12 @@ class AgentSuspendedLocally(Exception):
         self.lifecycle_status = lifecycle_status
         self.emergency_stop = emergency_stop
 
+    def __reduce__(self) -> tuple[type[AgentSuspendedLocally], tuple[str, bool]]:
+        # The default reduce replays `args` (the formatted message) into
+        # __init__, which takes two other parameters; without this the
+        # exception cannot cross a process boundary (multiprocessing, celery).
+        return (type(self), (self.lifecycle_status, self.emergency_stop))
+
 
 class SigningError(Exception):
     """Raised for a malformed private/public key, or an unverifiable or
