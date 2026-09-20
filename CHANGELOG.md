@@ -6,6 +6,58 @@ All notable changes to this project are documented in this file.
 
 Initial core SDK build. Not yet published to PyPI.
 
+### Added and changed (2026-09-20, tool-check outage behaviour and tool spans)
+
+Tool checks during a Gateway outage (BUILD-PLAN D19, TRD section 4.1):
+
+- **`tool_check_failure_mode`: `"fail_closed"` (default) or `"fail_open_bounded"`**,
+  with `fail_open_max_stale_seconds` (default 300, hard-capped at 300 and rejected
+  above that at config load), `tool_check_breaker_threshold` (3) and
+  `tool_check_breaker_cooldown` (30 s). Env: `MATIMO_TOOL_CHECK_FAILURE_MODE`,
+  `MATIMO_FAIL_OPEN_MAX_STALE_SECONDS`. Applies to `Governor`/`AsyncGovernor`
+  `guard()`, `check_tool()`, `check_and_wait()` and every adapter.
+- **Circuit breaker on transport-level failures only** (connection errors, timeouts,
+  5xx): after N consecutive failures a check fails fast for the cooldown instead of
+  waiting out the transport's retries on every call; then one half-open probe.
+- **`ToolCheckUnavailable`** (subclass of `GatewayUnavailable`, so existing handlers
+  still match) is raised when a check cannot be answered and the mode is fail-closed.
+  Adapters now return it as a recoverable tool error where they return a DENY
+  (LangChain `ToolException`, ADK `{"error": ...}`; CrewAI and AutoGen let their own
+  tool loop handle the raised exception). Before this, a Gateway outage raised a raw
+  `GatewayError` out of the ADK plugin and the LangChain wrapper and could crash the run.
+- **Fail-open is bounded and marked.** A degraded ALLOW has `ToolDecision.degraded`
+  and its tool span carries `matimo.degraded_mode=true` and
+  `matimo.degraded_cache_age_seconds`. It is never granted on: an explicit DENY, an
+  unrecognized decision, any 4xx, a locally-known suspended state, or a PENDING
+  (polling failures, and the re-check after a PENDING with no resume token). The
+  SDK also refuses to fail open for a tool whose most recent decision in the process
+  was DENY or PENDING, because it does not hold the policy. `GovernanceState` gained
+  `last_heartbeat_monotonic` (None until a heartbeat arrives) for the freshness rule.
+
+Tool spans:
+
+- **BEHAVIOR CHANGE: tool results are no longer sent by default.** New
+  `capture_tool_results` (default `False`). Google ADK and the LangChain callback
+  handler used to send the result (truncated to 500 characters) on every tool span
+  unconditionally; they now send nothing unless it is on. When on, every adapter and
+  `guard()` send it (error text for a tool that raised), redacted like arguments, then
+  cut to 500 characters. Redaction now runs on the whole value before the cut, so a
+  secret straddling the 500th character is masked instead of half-sent. The gate is
+  one place (`Governor.tool_span()`), so no call site can forget it.
+- **LangChain: one span per tool call.** A tool wrapped by `govern_tools()` and also
+  seen by a callback handler used to be reported twice, and the wrapper's span sat in
+  a separate one-span run while the handler's sat in the chain's run. The wrapper is
+  now canonical: its single span carries arguments, status, result (when captured),
+  the degraded marker, and LangChain's own run and span ids, so it joins the chain's
+  run; the handler skips its span for that call. An unwrapped tool still gets the
+  handler's span. A denied call's span carries the same ids when a handler is attached.
+- **LangChain LLM spans now carry `gen_ai.provider.name`**, mapped from the serialized
+  class (`ChatOpenAI` to `openai`, `ChatAnthropic` to `anthropic`,
+  `ChatGoogleGenerativeAI` to `google`); an unknown class gives no provider.
+
+Documented, not changed: CrewAI and AutoGen cannot group a crew or chat into one run
+automatically, so `governor.run()` is the grouping mechanism.
+
 ### Fixed (2026-09-20, end-to-end review; every item reproduced by script first)
 
 Governance and correctness:
