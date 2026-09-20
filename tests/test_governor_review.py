@@ -11,7 +11,7 @@ import pytest
 import respx
 
 from matimo_agdk.config import GatewayConfig
-from matimo_agdk.exceptions import ToolDenied
+from matimo_agdk.exceptions import GatewayError, ToolDenied
 from matimo_agdk.governor import AsyncGovernor, Governor
 from matimo_agdk.identity import IdentityCredentials
 
@@ -26,6 +26,9 @@ class RecordingExporter:
 
     def submit(self, event: dict[str, Any]) -> None:
         self.events.append(event)
+
+    def _raise_pending(self) -> None:
+        pass
 
     def stop(self) -> None:
         pass
@@ -55,7 +58,9 @@ def _mock_session() -> None:
     respx.post(f"{BASE_URL}/sessions").mock(
         return_value=httpx.Response(
             201,
-            json={"data": {"sessionToken": "tok", "expiresAt": future_iso(3600), "identityId": "x"}},
+            json={
+                "data": {"sessionToken": "tok", "expiresAt": future_iso(3600), "identityId": "x"}
+            },
         )
     )
 
@@ -167,4 +172,143 @@ async def test_async_guard_allow_and_deny(identity: IdentityCredentials) -> None
             await lookup(q="y")
     statuses = [e.get("status") for e in recorder.events if e["kind"] == "tool"]
     assert statuses == ["completed", "denied"]
+    await governor.aclose()
+
+
+# -- guard() must not let a telemetry error mask the tool's outcome ----------
+
+
+class FailClosedExporter(RecordingExporter):
+    """Mimics TelemetryExporter(fail_open=False) holding a stored flush
+    error: submit() consumes it and raises *before* recording the event."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_error: GatewayError | None = None
+
+    def _raise_pending(self) -> None:
+        if self.last_error is not None:
+            exc, self.last_error = self.last_error, None
+            raise exc
+
+    def submit(self, event: dict[str, Any]) -> None:
+        self._raise_pending()
+        super().submit(event)
+
+
+def _fail_closed_governor(identity: IdentityCredentials) -> tuple[Governor, FailClosedExporter]:
+    governor = Governor(_config(identity))
+    exporter = FailClosedExporter()
+    governor._telemetry = exporter  # type: ignore[assignment]  # noqa: SLF001
+    return governor, exporter
+
+
+@respx.mock
+def test_guard_refuses_before_the_tool_runs_when_telemetry_already_failed(
+    identity: IdentityCredentials,
+) -> None:
+    _mock_session()
+    check = respx.post(f"{BASE_URL}/tools/check").mock(
+        return_value=httpx.Response(200, json={"data": {"decision": "ALLOW"}})
+    )
+    governor, exporter = _fail_closed_governor(identity)
+    ran: list[int] = []
+
+    def wire(amount: int) -> str:
+        ran.append(1)
+        return "sent"
+
+    guarded = governor.guard(wire, name="wire")
+    with governor.run("r"):
+        exporter.last_error = GatewayError("flush failed")
+        with pytest.raises(GatewayError, match="flush failed"):
+            guarded(amount=1)
+        assert ran == []  # failed closed: no side effect, no approval spent
+        assert check.call_count == 0
+        assert guarded(amount=1) == "sent"  # the error was raised once, then cleared
+    assert ran == [1]
+
+
+@respx.mock
+def test_guard_keeps_the_result_when_telemetry_fails_after_the_tool_ran(
+    identity: IdentityCredentials,
+) -> None:
+    _mock_session()
+    respx.post(f"{BASE_URL}/tools/check").mock(
+        return_value=httpx.Response(200, json={"data": {"decision": "ALLOW"}})
+    )
+    governor, exporter = _fail_closed_governor(identity)
+
+    def wire(amount: int) -> str:
+        exporter.last_error = GatewayError("flush failed mid-call")
+        return "sent"
+
+    with governor.run("r"):
+        assert governor.guard(wire, name="wire")(amount=1) == "sent"
+    tool_events = [e for e in exporter.events if e["kind"] == "tool"]
+    assert [e["status"] for e in tool_events] == ["completed"]  # span not lost either
+
+
+@respx.mock
+def test_guard_propagates_the_tools_own_exception_not_the_telemetry_error(
+    identity: IdentityCredentials,
+) -> None:
+    _mock_session()
+    respx.post(f"{BASE_URL}/tools/check").mock(
+        return_value=httpx.Response(200, json={"data": {"decision": "ALLOW"}})
+    )
+    governor, exporter = _fail_closed_governor(identity)
+
+    def wire(amount: int) -> str:
+        exporter.last_error = GatewayError("flush failed mid-call")
+        raise ValueError("bank said no")
+
+    with governor.run("r"), pytest.raises(ValueError, match="bank said no"):
+        governor.guard(wire, name="wire")(amount=1)
+    tool_events = [e for e in exporter.events if e["kind"] == "tool"]
+    assert [e["status"] for e in tool_events] == ["error"]
+
+
+@respx.mock
+def test_guard_deny_still_raises_tool_denied_when_telemetry_fails(
+    identity: IdentityCredentials,
+) -> None:
+    _mock_session()
+    governor, exporter = _fail_closed_governor(identity)
+
+    def deny_and_break_telemetry(request: httpx.Request) -> httpx.Response:
+        exporter.last_error = GatewayError("flush failed during check")
+        return httpx.Response(200, json={"data": {"decision": "DENY", "reason": "nope"}})
+
+    respx.post(f"{BASE_URL}/tools/check").mock(side_effect=deny_and_break_telemetry)
+    with governor.run("r"), pytest.raises(ToolDenied):
+        governor.guard(lambda amount: "sent", name="wire")(amount=1)
+    assert [e["status"] for e in exporter.events if e["kind"] == "tool"] == ["denied"]
+
+
+@respx.mock
+async def test_async_guard_keeps_the_result_when_telemetry_fails_after_the_tool_ran(
+    identity: IdentityCredentials,
+) -> None:
+    _mock_session()
+    respx.post(f"{BASE_URL}/tools/check").mock(
+        return_value=httpx.Response(200, json={"data": {"decision": "ALLOW"}})
+    )
+    governor = AsyncGovernor(_config(identity))
+    exporter = FailClosedExporter()
+    governor._telemetry = exporter  # type: ignore[assignment]  # noqa: SLF001
+
+    async def stop() -> None:
+        pass
+
+    exporter.stop = stop  # type: ignore[method-assign,assignment]
+
+    @governor.guard(name="wire")
+    async def wire(amount: int) -> str:
+        exporter.last_error = GatewayError("flush failed mid-call")
+        return "sent"
+
+    async with governor.run("r"):
+        assert await wire(amount=1) == "sent"
+    assert [e["status"] for e in exporter.events if e["kind"] == "tool"] == ["completed"]
     await governor.aclose()

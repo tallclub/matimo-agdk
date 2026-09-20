@@ -16,12 +16,13 @@ that accepts a custom base_url and http client.
 from __future__ import annotations
 
 import functools
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, TypeVar
 
 import httpx
@@ -44,6 +45,8 @@ from .tools import AsyncToolGovernor, ToolDecision, ToolGovernor
 from .transport import AsyncGatewayHTTP, GatewayHTTP
 
 R = TypeVar("R")
+
+_log = logging.getLogger("matimo_agdk.governor")
 
 RUN_ID_HEADER = "X-Matimo-Run-Id"
 
@@ -74,7 +77,37 @@ def _bind_hint(exc: ImportError) -> ImportError:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
+
+
+def _raise_pending_telemetry_error(governor: Any) -> None:
+    """Under fail_open_telemetry=False, raise the exporter's stored flush
+    error now. guard() calls this before it checks or runs anything, so a
+    broken telemetry pipe fails the call closed with no side effects rather
+    than after the tool has already acted. A no-op when fail-open or clean."""
+    telemetry = governor._telemetry
+    if telemetry is not None:
+        telemetry._raise_pending()
+
+
+def _record_tool_span(governor: Any, tool_name: str, **kwargs: Any) -> None:
+    """tool_span() for a tool call that has already been decided or has run.
+
+    With fail_open_telemetry=False, tool_span() raises the exporter's stored
+    flush error, and submit() raises before enqueueing, so the span is lost
+    too. That error must not replace the tool's return value or its own
+    exception: it is logged, and the span is recorded once more (the raise
+    consumed the stored error, so the retry goes through). guard() refuses
+    *before* the tool runs instead -- see `_raise_pending_telemetry_error()`.
+    """
+    try:
+        governor.tool_span(tool_name, **kwargs)
+    except GatewayError as exc:
+        _log.warning("telemetry error after tool %r had already run: %s", tool_name, exc)
+        try:
+            governor.tool_span(tool_name, **kwargs)
+        except GatewayError:
+            pass
 
 
 def _identity_from_response(
@@ -499,6 +532,11 @@ class Governor:
         Raises ToolDenied if the check (or the resolved PENDING decision)
         is DENY. The wrapped callable's own exceptions propagate unchanged
         after being recorded as a failed tool span.
+
+        With `fail_open_telemetry=False`, a stored telemetry flush error is
+        raised *before* the check and the tool run, so the call fails closed
+        with no side effect. Once the tool has run, a telemetry error is only
+        logged: it never replaces the tool's result or its exception.
         """
 
         def decorator(inner: Callable[..., R]) -> Callable[..., R]:
@@ -516,9 +554,12 @@ class Governor:
                     with self.run(f"tool:{tool_name}"):
                         return wrapper(*args, **kwargs)
                 call_args = _positional_to_kwargs(args, kwargs)
+                _raise_pending_telemetry_error(self)
                 decision = tools.check_and_wait(tool_name, call_args, category_hint=category)
                 if decision.denied:
-                    self.tool_span(tool_name, status="denied", duration_ms=0, arguments=call_args)
+                    _record_tool_span(
+                        self, tool_name, status="denied", duration_ms=0, arguments=call_args
+                    )
                     raise ToolDenied(decision.reason)
 
                 started = time.monotonic()
@@ -533,7 +574,8 @@ class Governor:
                     raise
                 finally:
                     duration_ms = int((time.monotonic() - started) * 1000)
-                    self.tool_span(
+                    _record_tool_span(
+                        self,
                         tool_name,
                         status=status,
                         started_at=started_iso,
@@ -1022,9 +1064,12 @@ class AsyncGovernor:
                     async with self.run(f"tool:{tool_name}"):
                         return await wrapper(*args, **kwargs)
                 call_args = _positional_to_kwargs(args, kwargs)
+                _raise_pending_telemetry_error(self)
                 decision = await tools.check_and_wait(tool_name, call_args, category_hint=category)
                 if decision.denied:
-                    self.tool_span(tool_name, status="denied", duration_ms=0, arguments=call_args)
+                    _record_tool_span(
+                        self, tool_name, status="denied", duration_ms=0, arguments=call_args
+                    )
                     raise ToolDenied(decision.reason)
 
                 started = time.monotonic()
@@ -1039,7 +1084,8 @@ class AsyncGovernor:
                     raise
                 finally:
                     duration_ms = int((time.monotonic() - started) * 1000)
-                    self.tool_span(
+                    _record_tool_span(
+                        self,
                         tool_name,
                         status=status,
                         started_at=started_iso,
