@@ -6,6 +6,126 @@ All notable changes to this project are documented in this file.
 
 Initial core SDK build. Not yet published to PyPI.
 
+### Fixed (2026-09-20, end-to-end review; every item reproduced by script first)
+
+Governance and correctness:
+
+- **Fail closed on an unrecognized tool-check decision.** Only `ALLOW`, `DENY`
+  and `PENDING` exist in the contract; anything else (or a missing `decision`)
+  used to fall through `guard()` and every adapter and *ran the tool*. It now
+  resolves to `DENY` with reason `unrecognized_tool_check_decision`.
+- **Generic adapter dropped positional arguments** whenever any keyword argument
+  was present, so `f(1, b=2)` and `f(99, b=2)` shared one server-side dedup key
+  and could reuse each other's cached decision. Fixed with the shared
+  `call_args_from()`.
+- **LangChain: one call raised two policy checks** (and would have asked a human
+  to approve twice) for any tool without its own coroutine, because the default
+  `_arun` routes back through the wrapped `_run`. Checked once now. `govern_tools()`
+  is also idempotent (LangChain and AutoGen), and CrewAI's default `_arun`
+  (which only raises `NotImplementedError`) is no longer wrapped.
+- **LangChain callback handlers leaked memory** on failed chains: `on_chain_error`
+  was not implemented, so run-tree entries were never released.
+- **LangChain callback handlers left runs `running` in Gateway.** Every parentless
+  `.invoke()` (a bare LLM call, a bare tool call) became its own run under
+  LangChain's own run id, and nothing ever sent the terminal `kind:"run"` span
+  Gateway needs to end a run. The `langchain_agent.py` example showed one
+  completed run plus two `running` ones. Inside `governor.run()` the handlers now
+  join that run; outside one they open a run and close it `completed`/`failed`.
+- **Every other adapter had the same stuck-`running` bug outside `governor.run()`.**
+  `emit_llm_span()`/`emit_tool_span()` fell back to a fresh run id that nothing
+  closed, which hit CrewAI, AutoGen, the generic adapter's observe mode and async
+  bridge, and LangChain's tool wrapper (and every denied-tool span). The fallback
+  now wraps the span in a one-span run it opens and closes, as `Governor.guard()`
+  already did. `tests/adapters/test_run_lifecycle.py` holds every adapter to one
+  invariant: each run opens once and closes once, with the close last.
+- **ADK: a denied tool call landed in a run of its own** instead of the
+  invocation's run (`bind_run_id()` only covers model calls). It now uses the
+  invocation id. `MatimoPlugin` also takes `category=` like every other adapter.
+- **Generic `govern()` was not idempotent** (LangChain, CrewAI and AutoGen skip an
+  already-governed tool), so governing twice policy-checked one call twice.
+- **`rotate_key()` left existing clients signing with the revoked key.** Any
+  `httpx_client()` created before a rotation, plus adapters, the telemetry
+  exporter and `guard()`-wrapped callables, held the old signer. Identity is now
+  re-bound in place (`JWSSigner.rekey`, `SessionManager.rebind`, `ToolGovernor.rebind`).
+- **`guard()` could discard a tool's result after the tool had run.** With
+  `fail_open_telemetry=False`, a stored telemetry flush error was raised from the
+  span emission in `guard()`'s `finally`, replacing the tool's return value (or its
+  own exception) and skipping the result report. The error is now raised *before*
+  the check and the tool run (fail closed, no side effect); after the tool has
+  run it is logged and the span is still recorded. A DENY always raises
+  `ToolDenied`. Sync and async.
+- **`governor.run()` never closed the run on cancellation or `KeyboardInterrupt`**
+  (only on `Exception`), leaving it `running` server-side until the sweep. It now
+  closes with `cancelled`.
+
+Data loss and resilience:
+
+- `stop()` / `flush_now()` sent one batch only, silently discarding the rest of
+  the queue (302 queued events, 50 delivered). They now drain everything, and the
+  background loop no longer caps throughput at one batch per flush interval.
+- The exporter thread died silently on any non-`GatewayError` (a malformed session
+  response, a raising `on_suspend` callback), ending heartbeats and rapid-suspend
+  polling. Both are now contained and logged; a malformed session response is a
+  `GatewayError`.
+- A batch the server rejects outright (400/413/422) was re-queued and resent
+  forever, wedging telemetry; it is now dropped and counted in `dropped_count`.
+- `stop()` unregisters its `atexit` hook, and `on_suspend` callbacks survive
+  `stop()` then `start()`.
+- `register()` and `rotate_key()` bind the new identity before writing it to disk,
+  and credentials are written atomically (temp file, fsync, replace), so a failed
+  write can no longer destroy the only copy of a private key.
+- `status` polling and `check` now retry transient 5xx/connection errors: a
+  human-approval wait can last hours and a single 502 aborted it.
+
+Security:
+
+- `repr()` of `GatewayConfig` and `IdentityCredentials` no longer includes the API
+  key, identity token or private key PEM.
+- `set_tool_category()` percent-encodes the tool name; `"../identities/x"` used to
+  be normalised by the HTTP client into a different route, sent with the org key.
+- `Retry-After` is capped (`RetryPolicy.max_retry_after`, default 60s) and
+  `nan`/`inf`/negative values are ignored; a hostile header could park a thread
+  for a day. An exhausted 429 now exposes `RateLimited.retry_after`.
+- Redaction also scrubs string *values* for PEM private keys, `Bearer` credentials
+  and Matimo/OpenAI/GitHub/AWS key shapes, and is applied to the error text sent
+  to `/tools/result`. It remains a backstop, not a classifier.
+- `GatewayConfig` warns when credentials would cross plain `http` to a non-loopback
+  host.
+
+Behavior changes you may notice:
+
+- `Governor.register()` / `AsyncGovernor.register()` refuse to overwrite existing
+  credentials for the same name, before any network call (`overwrite=True`; CLI
+  `register --force`). Registering twice used to orphan the first identity.
+- `GatewayConfig` rejects unknown options and non-positive timeouts, batch sizes
+  and intervals instead of silently ignoring them; an unreadable
+  `MATIMO_PRIVATE_KEY_FILE` is an error instead of being ignored.
+- `register()`, `rotate_key()` and `start()` fail fast without an org API key.
+- `gateway_chat_model()`, `gateway_llm()` and `gateway_model()` raise a clear
+  `TypeError` for an `AsyncGovernor` (they previously crashed with "'coroutine'
+  object is not subscriptable", and the CrewAI docstring wrongly promised support).
+- CLI: `--version`, `register --force`; `doctor` and the other commands report a
+  malformed key or bad configuration as an `error:` line, not a traceback.
+- New public `Governor.flush()` / `AsyncGovernor.flush()`; the CLI no longer reaches
+  into private attributes. `AgentSuspendedLocally` is picklable.
+
+Found by the live check against a real Gateway:
+
+- **`anthropic` >= 1.6 rejected `governor.httpx_client()`** (`TypeError: ... this SDK
+  uses httpx2`). That release is built on `httpx2`, a separate library whose classes
+  are unrelated to `httpx`'s, so a live, signed client was impossible for Anthropic.
+  New `Governor.httpx2_client()` / `AsyncGovernor.httpx2_async_client()` (same live
+  session token, per-request signature and transparent re-handshake, as `httpx2`
+  clients) and `anthropic_http_client()`, which picks the client the installed
+  `anthropic` accepts by reading its declared requirements. `openai` still accepts
+  `httpx`; it now also ships an optional `httpx2` extra, so the same helper pattern
+  applies if it ever requires it.
+
+Tooling and docs: fixed 13 ruff errors and 8 unformatted files that would have
+failed CI; README no longer claims the header-only client works with
+`requireSignedRequests`; `CONTRIBUTING.md` documents the real setup and gate;
+added Dependabot for `uv` and GitHub Actions.
+
 ### Fixed (2026-09-19, Google ADK runs stayed `running` in Gateway Observability)
 
 - `MatimoPlugin` never emitted a `kind:"run"` span, and Gateway only ends a
@@ -177,3 +297,9 @@ Initial core SDK build. Not yet published to PyPI.
 - Google ADK and LangChain-with-Anthropic paths send the session header
   but no per-request signature (see the adapter docstrings).
 - Rapid suspend is polled at the heartbeat interval, never pushed.
+- `gateway_chat_model(provider="openai")` wires the sync `http_client` only, so
+  `ChatOpenAI` async methods use a session header fixed at construction and are
+  not signed. `gateway_*` helpers for LangChain, ADK and CrewAI need a sync
+  `Governor`; there is no async-native equivalent yet.
+- ADK plugin bookkeeping (`_open_runs`, `_pending_tool`) is not pruned for runs
+  the caller abandons mid-stream.
