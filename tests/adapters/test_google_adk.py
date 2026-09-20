@@ -6,6 +6,7 @@ import httpx
 import pytest
 import respx
 
+from matimo_agdk.config import GatewayConfig
 from matimo_agdk.exceptions import AgentSuspendedLocally
 from matimo_agdk.identity import IdentityCredentials
 from matimo_agdk.tools import ToolDecision
@@ -347,6 +348,8 @@ async def test_governor_run_span_emits_kind_run_event() -> None:
     from matimo_agdk.governor import AsyncGovernor
 
     gov = AsyncGovernor.__new__(AsyncGovernor)
+
+    gov.config = GatewayConfig()
     gov._telemetry = MagicMock()
     gov.run_span("e-inv-9", status="completed", name="adk", duration_ms=12)
 
@@ -366,6 +369,8 @@ def _real_span_governor() -> tuple[object, MagicMock]:
     from matimo_agdk.governor import AsyncGovernor
 
     gov = AsyncGovernor.__new__(AsyncGovernor)
+
+    gov.config = GatewayConfig()
     gov._telemetry = MagicMock()
     return gov, gov._telemetry
 

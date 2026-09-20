@@ -46,6 +46,11 @@ crashing the run -- the same graceful-recovery shape as the other
 adapters. `mode="observe"` only records tool spans, never calls
 `check_tool()`.
 
+A Gateway outage that leaves a tool check unanswered (fail-closed) raises
+`ToolCheckUnavailable` from the same place, and is surfaced to the model the same
+way. With `tool_check_failure_mode="fail_open_bounded"` the tool may run instead,
+and its span is marked `matimo.degraded_mode`.
+
 Rapid suspend (`mode="govern"` only): `governor.raise_if_suspended()` is
 called before each wrapped tool's real body runs.
 
@@ -82,6 +87,7 @@ import functools
 import time
 from typing import Any
 
+from .._outage import degraded_attributes
 from ..exceptions import ToolDenied
 from ._shared import (
     Mode,
@@ -118,17 +124,24 @@ def _wrap_run(inner: Any, tool_name: str, governor: Any, mode: Mode, category: s
     @functools.wraps(inner)
     async def wrapper(args: Any, cancellation_token: Any = None, *a: Any, **kw: Any) -> Any:
         call_args = _args_to_dict(args)
+        decision = None
         if mode == "govern":
             await async_raise_if_suspended(governor)
+            # A ToolCheckUnavailable (Gateway unreachable, fail-closed) propagates like
+            # ToolDenied: AutoGen turns either into an `is_error` tool result.
             decision = await async_check_and_wait(governor, tool_name, call_args, category=category)
             if decision.denied:
                 raise ToolDenied(decision.reason)
         started = _now()
         status = "completed"
+        span_result: Any = None
         try:
-            return await inner(args, cancellation_token, *a, **kw)
-        except Exception:
+            result = await inner(args, cancellation_token, *a, **kw)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             emit_tool_span(
@@ -137,6 +150,8 @@ def _wrap_run(inner: Any, tool_name: str, governor: Any, mode: Mode, category: s
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
                 arguments=call_args,
+                result=span_result,
+                attributes=degraded_attributes(decision),
             )
 
     return wrapper

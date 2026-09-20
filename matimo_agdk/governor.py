@@ -28,6 +28,7 @@ from typing import Any, TypeVar
 import httpx
 
 from ._compat import sdk_requires_httpx2
+from ._outage import OutageGuard, degraded_attributes
 from ._retry_transport import AsyncSessionRetryTransport, SessionRetryTransport
 from .config import GatewayConfig
 from .exceptions import GatewayError, ToolDenied
@@ -108,6 +109,29 @@ def _record_tool_span(governor: Any, tool_name: str, **kwargs: Any) -> None:
             governor.tool_span(tool_name, **kwargs)
         except GatewayError:
             pass
+
+
+def _outage_guard(
+    config: GatewayConfig, state_provider: Callable[[], GovernanceState]
+) -> OutageGuard:
+    """The circuit breaker and fail-open policy for one governor's tool checks.
+    `state_provider` gives it the polled heartbeat state (freshness, suspended)."""
+    return OutageGuard(
+        failure_mode=config.tool_check_failure_mode,
+        max_stale_seconds=config.fail_open_max_stale_seconds,
+        breaker_threshold=config.tool_check_breaker_threshold,
+        breaker_cooldown=config.tool_check_breaker_cooldown,
+        state_provider=state_provider,
+    )
+
+
+def _tool_span_kwargs(config: GatewayConfig, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Drops `result` unless `capture_tool_results` is on: one gate for every
+    adapter and guard(), so no call site can forget it. Redaction and the
+    500-character cut happen later, in telemetry.tool_span()."""
+    if not config.capture_tool_results:
+        kwargs.pop("result", None)
+    return kwargs
 
 
 def _identity_from_response(
@@ -271,6 +295,7 @@ class Governor:
             identity_id=identity.identity_id,
             tenant_id=identity.tenant_id,
             external_framework=identity.external_framework,
+            outage=_outage_guard(self.config, lambda: self.state),
         )
         self._identity = identity
 
@@ -490,7 +515,7 @@ class Governor:
                 "tool_span() needs an active governor.run() block or an explicit run_id"
             )
         kwargs.setdefault("session_id", run_id)
-        self._emit(tool_span(run_id, tool_name, **kwargs))
+        self._emit(tool_span(run_id, tool_name, **_tool_span_kwargs(self.config, kwargs)))
 
     # -- tool governance ----------------------------------------------------
 
@@ -573,11 +598,14 @@ class Governor:
                 started_iso = _now_iso()
                 status = "completed"
                 error: str | None = None
+                span_result: Any = None
                 try:
                     result = inner(*args, **kwargs)
+                    span_result = result
                 except Exception as exc:
                     status = "error"
                     error = str(exc)
+                    span_result = error
                     raise
                 finally:
                     duration_ms = int((time.monotonic() - started) * 1000)
@@ -588,6 +616,8 @@ class Governor:
                         started_at=started_iso,
                         duration_ms=duration_ms,
                         arguments=call_args,
+                        result=span_result,
+                        attributes=degraded_attributes(decision),
                     )
                     if decision.resume_token:
                         tools.report_result(
@@ -818,6 +848,7 @@ class AsyncGovernor:
             identity_id=identity.identity_id,
             tenant_id=identity.tenant_id,
             external_framework=identity.external_framework,
+            outage=_outage_guard(self.config, lambda: self.state),
         )
         self._identity = identity
 
@@ -1019,7 +1050,7 @@ class AsyncGovernor:
                 "tool_span() needs an active governor.run() block or an explicit run_id"
             )
         kwargs.setdefault("session_id", run_id)
-        self._emit(tool_span(run_id, tool_name, **kwargs))
+        self._emit(tool_span(run_id, tool_name, **_tool_span_kwargs(self.config, kwargs)))
 
     async def check_tool(
         self, tool_name: str, args: dict[str, Any] | None = None, **kwargs: Any
@@ -1079,11 +1110,14 @@ class AsyncGovernor:
                 started_iso = _now_iso()
                 status = "completed"
                 error: str | None = None
+                span_result: Any = None
                 try:
                     result = await inner(*args, **kwargs)
+                    span_result = result
                 except Exception as exc:
                     status = "error"
                     error = str(exc)
+                    span_result = error
                     raise
                 finally:
                     duration_ms = int((time.monotonic() - started) * 1000)
@@ -1094,6 +1128,8 @@ class AsyncGovernor:
                         started_at=started_iso,
                         duration_ms=duration_ms,
                         arguments=call_args,
+                        result=span_result,
+                        attributes=degraded_attributes(decision),
                     )
                     if decision.resume_token:
                         await tools.report_result(

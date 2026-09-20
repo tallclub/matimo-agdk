@@ -40,6 +40,7 @@ import inspect
 import time
 from typing import Any
 
+from .._outage import degraded_attributes
 from ..exceptions import ToolDenied
 from ._shared import (
     Mode,
@@ -61,10 +62,14 @@ def _observe_sync(fn: Any, name: str, governor: Any) -> Any:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         started = _now()
         status = "completed"
+        span_result: Any = None
         try:
-            return fn(*args, **kwargs)
-        except Exception:
+            result = fn(*args, **kwargs)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             emit_tool_span(
@@ -73,6 +78,7 @@ def _observe_sync(fn: Any, name: str, governor: Any) -> Any:
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
                 arguments=call_args_from(args, kwargs),
+                result=span_result,
             )
 
     return wrapper
@@ -83,10 +89,14 @@ def _observe_async(fn: Any, name: str, governor: Any) -> Any:
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         started = _now()
         status = "completed"
+        span_result: Any = None
         try:
-            return await fn(*args, **kwargs)
-        except Exception:
+            result = await fn(*args, **kwargs)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             emit_tool_span(
@@ -95,6 +105,7 @@ def _observe_async(fn: Any, name: str, governor: Any) -> Any:
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
                 arguments=call_args_from(args, kwargs),
+                result=span_result,
             )
 
     return wrapper
@@ -144,10 +155,14 @@ def _govern_uncached(
                     raise ToolDenied(decision.reason)
                 started = _now()
                 status = "completed"
+                span_result: Any = None
                 try:
-                    return await fn(*args, **kwargs)
-                except Exception:
+                    result = await fn(*args, **kwargs)
+                    span_result = result
+                    return result
+                except Exception as exc:
                     status = "error"
+                    span_result = str(exc)
                     raise
                 finally:
                     emit_tool_span(
@@ -156,6 +171,8 @@ def _govern_uncached(
                         status=status,
                         duration_ms=int((_now() - started) * 1000),
                         arguments=call_args,
+                        result=span_result,
+                        attributes=degraded_attributes(decision),
                     )
 
             return bridged

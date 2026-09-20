@@ -26,6 +26,7 @@ from crewai.tools import BaseTool as CrewBaseTool
 from langchain_core.tools import ToolException, tool
 from pydantic import BaseModel
 
+from matimo_agdk.config import GatewayConfig
 from matimo_agdk.exceptions import ToolDenied
 from matimo_agdk.governor import Governor
 from matimo_agdk.tools import ToolDecision
@@ -35,6 +36,7 @@ def _governor(decision: str = "ALLOW") -> Governor:
     """A real Governor (real span builders, real `run_span()`) with a mock
     exporter and a stubbed policy check -- no network."""
     gov = Governor.__new__(Governor)
+    gov.config = GatewayConfig()
     gov._telemetry = MagicMock()
     gov.check_and_wait = MagicMock(  # type: ignore[method-assign]
         return_value=ToolDecision(decision=decision, reason="nope" if decision == "DENY" else None)
