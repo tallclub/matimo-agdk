@@ -218,6 +218,7 @@ class Governor:
         self._tools: ToolGovernor | None = None
         self._telemetry: TelemetryExporter | None = None
         self._started = False
+        self._on_suspend_callback: Callable[[GovernanceState], None] | None = None
         # True once this process wrote (or found) a credentials file for the
         # bound identity; rotate_key() only overwrites the file in that case,
         # so a persist=False identity never leaks into ~/.matimo/agents.
@@ -364,6 +365,7 @@ class Governor:
             heartbeat_interval=heartbeat_interval,
             fail_open=self.config.fail_open_telemetry,
             heartbeat_resolver=self.config.resolved_heartbeat_interval,
+            on_suspend=self._on_suspend_callback,
         )
         self._telemetry.start()
         self._started = True
@@ -406,7 +408,15 @@ class Governor:
     def on_suspend(self, callback: Callable[[GovernanceState], None]) -> None:
         if self._telemetry is None:
             raise GatewayError("call governor.start() before registering an on_suspend callback")
-        self._telemetry._on_suspend = callback  # noqa: SLF001 -- single intended internal caller
+        self._on_suspend_callback = callback  # survives stop() then start()
+        self._telemetry.set_on_suspend(callback)
+
+    def flush(self) -> None:
+        """Sends everything queued right now, plus one heartbeat poll (which
+        refreshes `governor.state`). Raises GatewayError if the send fails."""
+        if self._telemetry is None:
+            raise GatewayError("call governor.start() before flush()")
+        self._telemetry.flush_now()
 
     # -- runs and spans ----------------------------------------------------
 
@@ -763,6 +773,7 @@ class AsyncGovernor:
         self._tools: AsyncToolGovernor | None = None
         self._telemetry: AsyncTelemetryExporter | None = None
         self._started = False
+        self._on_suspend_callback: Callable[[GovernanceState], None] | None = None
         # True once this process wrote (or found) a credentials file for the
         # bound identity; rotate_key() only overwrites the file in that case,
         # so a persist=False identity never leaks into ~/.matimo/agents.
@@ -889,6 +900,7 @@ class AsyncGovernor:
             heartbeat_interval=heartbeat_interval,
             fail_open=self.config.fail_open_telemetry,
             heartbeat_resolver=self.config.resolved_heartbeat_interval,
+            on_suspend=self._on_suspend_callback,
         )
         await self._telemetry.start()
         self._started = True
@@ -928,7 +940,14 @@ class AsyncGovernor:
             raise GatewayError(
                 "call await governor.start() before registering an on_suspend callback"
             )
-        self._telemetry._on_suspend = callback  # noqa: SLF001
+        self._on_suspend_callback = callback  # survives stop() then start()
+        self._telemetry.set_on_suspend(callback)
+
+    async def flush(self) -> None:
+        """Async twin of Governor.flush()."""
+        if self._telemetry is None:
+            raise GatewayError("call await governor.start() before flush()")
+        await self._telemetry.flush_now()
 
     @asynccontextmanager
     async def run(self, name: str = "agent-run") -> AsyncIterator[str]:
