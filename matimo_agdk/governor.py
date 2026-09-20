@@ -93,6 +93,61 @@ def _identity_from_response(
     )
 
 
+def _register_body(
+    config: GatewayConfig,
+    display_name: str | None,
+    framework: str | None,
+    allowed_tool_categories: list[str] | None,
+    allowed_llm_models: list[str] | None,
+    registration_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "displayName": display_name or config.agent_name,
+        "externalFramework": framework or config.framework,
+    }
+    if allowed_tool_categories is not None:
+        body["allowedToolCategories"] = allowed_tool_categories
+    if allowed_llm_models is not None:
+        body["allowedLlmModels"] = allowed_llm_models
+    if registration_metadata is not None:
+        body["registrationMetadata"] = registration_metadata
+    return body
+
+
+def _require_api_key(config: GatewayConfig) -> None:
+    if not config.api_key:
+        raise GatewayError(
+            "no org API key configured: set MATIMO_API_KEY or pass api_key=... "
+            "(every Gateway call, including the session handshake, needs it)"
+        )
+
+
+def _refuse_to_overwrite(config: GatewayConfig, name: str) -> None:
+    """Runs BEFORE the network call. POST /v1/identities is not idempotent and
+    the private key is returned exactly once, so registering over an existing
+    credentials file would orphan the previous identity with its key gone."""
+    meta_path, key_path = credentials_paths(name, config.credentials_dir)
+    if meta_path.exists() or key_path.exists():
+        raise GatewayError(
+            f"credentials for {name!r} already exist at {meta_path}. Registering again "
+            "would create a second identity and destroy the private key of the first. "
+            "Pass overwrite=True (CLI: --force) to replace them, or choose another name.",
+            code="credentials_exist",
+        )
+
+
+def _save_or_explain(identity: IdentityCredentials, credentials_dir: Any) -> None:
+    try:
+        save_credentials(identity, credentials_dir)
+    except OSError as exc:
+        raise GatewayError(
+            f"identity {identity.identity_id} exists on the server but its credentials "
+            f"could not be written ({exc}). The private key was returned once and is "
+            "still in memory as `governor.identity.private_key_pem` -- persist it now.",
+            code="credentials_not_saved",
+        ) from exc
+
+
 def _positional_to_kwargs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
     """Best-effort reconstruction of "the tool's arguments" as a dict, for
     hashing and for the human-reviewer-facing `args` field on a PENDING
@@ -147,7 +202,22 @@ class Governor:
     # -- identity / registration ------------------------------------------
 
     def _bind_identity(self, identity: IdentityCredentials) -> None:
-        self._identity = identity
+        if self._signer is not None and self._session is not None and self._tools is not None:
+            # Rebinding (register() again, rotate_key()): update the existing
+            # signer/session/tool objects in place. httpx clients, framework
+            # adapters, the telemetry exporter and guard()-wrapped callables all
+            # captured references to them; replacing them would leave those
+            # signing with the old, revoked key.
+            self._signer.rekey(identity)
+            self._session.rebind(identity)
+            self._tools.rebind(
+                identity_token=identity.identity_token,
+                identity_id=identity.identity_id,
+                tenant_id=identity.tenant_id,
+                external_framework=identity.external_framework,
+            )
+            self._identity = identity
+            return
         self._signer = JWSSigner.from_credentials(identity)
         self._http.signer = self._signer
         self._session = SessionManager(self._http, self._signer, identity)
@@ -158,6 +228,7 @@ class Governor:
             tenant_id=identity.tenant_id,
             external_framework=identity.external_framework,
         )
+        self._identity = identity
 
     @property
     def identity(self) -> IdentityCredentials | None:
@@ -172,27 +243,32 @@ class Governor:
         allowed_llm_models: list[str] | None = None,
         registration_metadata: dict[str, Any] | None = None,
         persist: bool = True,
+        overwrite: bool = False,
     ) -> IdentityCredentials:
         """POST /v1/identities. Not idempotent server-side -- calling this
         twice creates two identities. Persists the one-time privateKeyPem
-        locally unless persist=False."""
-        body: dict[str, Any] = {
-            "displayName": display_name or self.config.agent_name,
-            "externalFramework": framework or self.config.framework,
-        }
-        if allowed_tool_categories is not None:
-            body["allowedToolCategories"] = allowed_tool_categories
-        if allowed_llm_models is not None:
-            body["allowedLlmModels"] = allowed_llm_models
-        if registration_metadata is not None:
-            body["registrationMetadata"] = registration_metadata
-
+        locally unless persist=False, and refuses (before any network call)
+        to overwrite an existing credentials file unless overwrite=True."""
+        _require_api_key(self.config)
+        name = display_name or self.config.agent_name
+        if persist and not overwrite:
+            _refuse_to_overwrite(self.config, name)
+        body = _register_body(
+            self.config,
+            display_name,
+            framework,
+            allowed_tool_categories,
+            allowed_llm_models,
+            registration_metadata,
+        )
         resp = self._http.request("POST", REGISTER_PATH, json_body=body, sign=False)
         identity = _identity_from_response(resp.data, base_url=self.config.base_url)
-        if persist:
-            save_credentials(identity, self.config.credentials_dir)
-            self._persisted = True
+        # Bind before persisting: the key exists exactly once, so it must be held
+        # in memory even if the disk write below fails.
         self._bind_identity(identity)
+        if persist:
+            _save_or_explain(identity, self.config.credentials_dir)
+            self._persisted = True
         return identity
 
     def rotate_key(self) -> IdentityCredentials:
@@ -209,8 +285,9 @@ class Governor:
         identity = _identity_from_response(
             resp.data, base_url=self.config.base_url, fallback_created_at=self._identity.created_at
         )
-        self._persist_rotated(identity)
+        # Bind first: the new key is returned exactly once (see register()).
         self._bind_identity(identity)
+        self._persist_rotated(identity)
         return identity
 
     def _persist_rotated(self, identity: IdentityCredentials) -> None:
@@ -220,7 +297,7 @@ class Governor:
         copy, exactly as with register(persist=False)."""
         meta_path, _ = credentials_paths(identity.display_name, self.config.credentials_dir)
         if self._persisted or meta_path.exists():
-            save_credentials(identity, self.config.credentials_dir)
+            _save_or_explain(identity, self.config.credentials_dir)
             self._persisted = True
 
     # -- lifecycle ---------------------------------------------------------
@@ -233,6 +310,7 @@ class Governor:
             )
         if self._started:
             return self
+        _require_api_key(self.config)
         heartbeat_interval = self.config.resolved_heartbeat_interval()
         self._telemetry = TelemetryExporter(
             self._http,
@@ -669,7 +747,18 @@ class AsyncGovernor:
         return cls(GatewayConfig.load(**overrides))
 
     def _bind_identity(self, identity: IdentityCredentials) -> None:
-        self._identity = identity
+        if self._signer is not None and self._session is not None and self._tools is not None:
+            # See Governor._bind_identity: rebind in place so captured references stay valid.
+            self._signer.rekey(identity)
+            self._session.rebind(identity)
+            self._tools.rebind(
+                identity_token=identity.identity_token,
+                identity_id=identity.identity_id,
+                tenant_id=identity.tenant_id,
+                external_framework=identity.external_framework,
+            )
+            self._identity = identity
+            return
         self._signer = JWSSigner.from_credentials(identity)
         self._http.signer = self._signer
         self._session = AsyncSessionManager(self._http, self._signer, identity)
@@ -680,6 +769,7 @@ class AsyncGovernor:
             tenant_id=identity.tenant_id,
             external_framework=identity.external_framework,
         )
+        self._identity = identity
 
     @property
     def identity(self) -> IdentityCredentials | None:
@@ -694,24 +784,27 @@ class AsyncGovernor:
         allowed_llm_models: list[str] | None = None,
         registration_metadata: dict[str, Any] | None = None,
         persist: bool = True,
+        overwrite: bool = False,
     ) -> IdentityCredentials:
-        body: dict[str, Any] = {
-            "displayName": display_name or self.config.agent_name,
-            "externalFramework": framework or self.config.framework,
-        }
-        if allowed_tool_categories is not None:
-            body["allowedToolCategories"] = allowed_tool_categories
-        if allowed_llm_models is not None:
-            body["allowedLlmModels"] = allowed_llm_models
-        if registration_metadata is not None:
-            body["registrationMetadata"] = registration_metadata
-
+        """Async twin of Governor.register()."""
+        _require_api_key(self.config)
+        name = display_name or self.config.agent_name
+        if persist and not overwrite:
+            _refuse_to_overwrite(self.config, name)
+        body = _register_body(
+            self.config,
+            display_name,
+            framework,
+            allowed_tool_categories,
+            allowed_llm_models,
+            registration_metadata,
+        )
         resp = await self._http.request("POST", REGISTER_PATH, json_body=body, sign=False)
         identity = _identity_from_response(resp.data, base_url=self.config.base_url)
-        if persist:
-            save_credentials(identity, self.config.credentials_dir)
-            self._persisted = True
         self._bind_identity(identity)
+        if persist:
+            _save_or_explain(identity, self.config.credentials_dir)
+            self._persisted = True
         return identity
 
     async def rotate_key(self) -> IdentityCredentials:
@@ -723,8 +816,9 @@ class AsyncGovernor:
         identity = _identity_from_response(
             resp.data, base_url=self.config.base_url, fallback_created_at=self._identity.created_at
         )
-        self._persist_rotated(identity)
+        # Bind first: the new key is returned exactly once (see register()).
         self._bind_identity(identity)
+        self._persist_rotated(identity)
         return identity
 
     def _persist_rotated(self, identity: IdentityCredentials) -> None:
@@ -734,7 +828,7 @@ class AsyncGovernor:
         copy, exactly as with register(persist=False)."""
         meta_path, _ = credentials_paths(identity.display_name, self.config.credentials_dir)
         if self._persisted or meta_path.exists():
-            save_credentials(identity, self.config.credentials_dir)
+            _save_or_explain(identity, self.config.credentials_dir)
             self._persisted = True
 
     async def start(self) -> AsyncGovernor:
@@ -745,6 +839,7 @@ class AsyncGovernor:
             )
         if self._started:
             return self
+        _require_api_key(self.config)
         heartbeat_interval = self.config.resolved_heartbeat_interval()
         self._telemetry = AsyncTelemetryExporter(
             self._http,

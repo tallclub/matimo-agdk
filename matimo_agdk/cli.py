@@ -41,6 +41,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             display_name=args.name,
             framework=args.framework,
             allowed_tool_categories=args.tool_category or None,
+            overwrite=args.force,
         )
     except GatewayError as exc:
         print(f"registration failed: {exc.message}", file=sys.stderr)
@@ -162,6 +163,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_register.add_argument(
         "--tool-category", action="append", default=[], help="Allowed tool category (repeatable)"
+    )
+    p_register.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing local credentials for --name (destroys the old private key)",
     )
     p_register.set_defaults(func=cmd_register)
 

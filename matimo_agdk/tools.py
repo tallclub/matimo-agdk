@@ -136,6 +136,21 @@ class ToolGovernor:
         self.max_wait_seconds = max_wait_seconds
         self.recheck_delays = recheck_delays
 
+    def rebind(
+        self,
+        *,
+        identity_token: str,
+        identity_id: str,
+        tenant_id: str,
+        external_framework: str | None = None,
+    ) -> None:
+        """Adopts a rotated identity in place, so a `guard()`-wrapped callable
+        that captured this object keeps working after `rotate_key()`."""
+        self._identity_token = identity_token
+        self._identity_id = identity_id
+        self._tenant_id = tenant_id
+        self._external_framework = external_framework
+
     def _headers(self) -> dict[str, str]:
         return {IDENTITY_TOKEN_HEADER: self._identity_token}
 
@@ -283,6 +298,21 @@ class AsyncToolGovernor:
         self.poll_max_interval = poll_max_interval
         self.max_wait_seconds = max_wait_seconds
         self.recheck_delays = recheck_delays
+
+    def rebind(
+        self,
+        *,
+        identity_token: str,
+        identity_id: str,
+        tenant_id: str,
+        external_framework: str | None = None,
+    ) -> None:
+        """Adopts a rotated identity in place, so a `guard()`-wrapped callable
+        that captured this object keeps working after `rotate_key()`."""
+        self._identity_token = identity_token
+        self._identity_id = identity_id
+        self._tenant_id = tenant_id
+        self._external_framework = external_framework
 
     def _headers(self) -> dict[str, str]:
         return {IDENTITY_TOKEN_HEADER: self._identity_token}

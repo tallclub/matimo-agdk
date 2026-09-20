@@ -27,10 +27,11 @@ import hashlib
 import json
 import os
 import stat
+import tempfile
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -91,11 +92,12 @@ class IdentityCredentials:
     """Everything AGDK needs to act as one registered Gateway identity."""
 
     identity_id: str
-    identity_token: str
+    # repr=False: a repr ends up in logs, tracebacks and debugger panes.
+    identity_token: str = field(repr=False)
     tenant_id: str
     display_name: str
     external_framework: str | None
-    private_key_pem: str
+    private_key_pem: str = field(repr=False)
     base_url: str | None = None
     public_key_fingerprint: str | None = None
     created_at: str | None = None
@@ -128,11 +130,25 @@ def credentials_paths(agent_name: str, credentials_dir: Path | None = None) -> t
 
 
 def _write_private(path: Path, text: str) -> None:
-    """Creates (or truncates) `path` with mode 0600 from the first byte, so
-    there is no window at the process umask between write and chmod."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    """Atomically replaces `path` with `text`, created mode 0600 from the
+    first byte (mkstemp), so there is no window at the process umask between
+    write and chmod and no window where a crash leaves a truncated file.
+
+    Atomicity matters here: the server returns the private key exactly once,
+    so a half-written credentials file is an unrecoverable identity."""
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _restrict_permissions(path: Path) -> None:
@@ -160,10 +176,12 @@ def save_credentials(
     """
     meta_path, key_path = credentials_paths(creds.display_name, credentials_dir)
     meta_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_private(meta_path, json.dumps(creds.to_metadata_dict(), indent=2))
+    # Key first: load_credentials() needs both files, and the metadata file is
+    # the one that makes the pair visible, so it is written last.
     _write_private(key_path, creds.private_key_pem)
-    _restrict_permissions(meta_path)
+    _write_private(meta_path, json.dumps(creds.to_metadata_dict(), indent=2))
     _restrict_permissions(key_path)
+    _restrict_permissions(meta_path)
     return meta_path, key_path
 
 
@@ -174,9 +192,9 @@ def load_credentials(
     if not meta_path.exists() or not key_path.exists():
         return None
     try:
-        meta = json.loads(meta_path.read_text())
-        private_key_pem = key_path.read_text()
-    except (OSError, json.JSONDecodeError):
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        private_key_pem = key_path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
         return None
     required = ("identity_id", "identity_token", "tenant_id", "display_name")
     if not all(meta.get(field) for field in required):
@@ -225,6 +243,18 @@ class JWSSigner:
         self.default_identity_id = identity_id
         self.default_tenant_id = tenant_id
         self.default_external_framework = external_framework
+
+    def rekey(self, creds: IdentityCredentials) -> None:
+        """Swaps this signer's key material in place. Anything that already
+        holds a reference to the signer (an httpx client, a session manager)
+        signs with the new key from the next request on; the PEM is parsed
+        before anything is mutated, so a bad key leaves the signer intact."""
+        fresh = JWSSigner.from_credentials(creds)
+        self._private_key = fresh._private_key
+        self.identity_token = fresh.identity_token
+        self.default_identity_id = fresh.default_identity_id
+        self.default_tenant_id = fresh.default_tenant_id
+        self.default_external_framework = fresh.default_external_framework
 
     @classmethod
     def from_credentials(cls, creds: IdentityCredentials) -> JWSSigner:
