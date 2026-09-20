@@ -63,14 +63,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 1
     try:
         governor.start()
-        assert governor._telemetry is not None  # noqa: SLF001 -- guaranteed by start()
-        governor._telemetry.flush_now()  # noqa: SLF001 -- CLI-internal, forces one heartbeat now
+        governor.flush()  # forces one heartbeat now
         state = governor.state
     except GatewayError as exc:
         print(f"status check failed: {exc.message}", file=sys.stderr)
         return 1
     finally:
-        governor.stop()
+        governor.close()
     print(
         f"identity:            {governor.identity.identity_id} ({governor.identity.display_name})"
     )
@@ -125,15 +124,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     try:
         governor.start()
-        assert governor._telemetry is not None  # noqa: SLF001 -- guaranteed by start()
-        governor._telemetry.flush_now()  # noqa: SLF001
+        governor.flush()
         state = governor.state
         print(f"  [ok] telemetry heartbeat succeeded: lifecycle_status={state.lifecycle_status}")
     except GatewayError as exc:
         print(f"  [FAIL] telemetry heartbeat failed: {exc.message}")
         return 1
     finally:
-        governor.stop()
+        governor.close()
 
     print("doctor: all checks passed")
     return 0

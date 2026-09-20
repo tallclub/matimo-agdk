@@ -35,6 +35,19 @@ Kind = Literal["run", "llm", "tool", "log", "error"]
 
 _MAX_ATTRIBUTE_VALUE_LEN = 2000
 
+# 4xx statuses that mean "this request as sent will never be accepted".
+# 401/403 (session/auth/policy), 408 and 429 are excluded: those are about the
+# sender's state or a passing condition, so the same batch may succeed later.
+_TRANSIENT_4XX = frozenset({401, 403, 408, 425, 429})
+
+
+def _is_permanent_rejection(exc: GatewayError) -> bool:
+    """True when the server rejected the batch itself (400 validation error,
+    413 too large, 422, ...). Retrying that same batch forever would wedge the
+    exporter behind one poison event, so it is dropped instead."""
+    status = exc.status_code
+    return status is not None and 400 <= status < 500 and status not in _TRANSIENT_4XX
+
 
 # ---------------------------------------------------------------------------
 # GovernanceState
@@ -287,11 +300,17 @@ class TelemetryExporter:
     def stop(self, *, timeout: float = 5.0) -> None:
         if self._thread is None:
             return
+        # Drop the atexit reference: it would otherwise pin this exporter (and
+        # its HTTP client) for the life of the process and fire again at exit.
+        atexit.unregister(self.stop)
         self._stop_event.set()
         self._thread.join(timeout=timeout)
         self._thread = None
-        self._flush(force=True)
+        self._flush_all()
         self._raise_pending()
+
+    def set_on_suspend(self, callback: Callable[[GovernanceState], None] | None) -> None:
+        self._on_suspend = callback
 
     def _raise_pending(self) -> None:
         if self._fail_open or self.last_error is None:
@@ -315,18 +334,34 @@ class TelemetryExporter:
                 self.dropped_count += 1
 
     def flush_now(self) -> None:
-        """Synchronous, on-demand flush -- mainly for tests and for
+        """Synchronous, on-demand flush of everything queued (always at least
+        one request, so it doubles as a heartbeat) -- for tests, the CLI and
         `governor.stop()`'s final drain."""
-        self._flush(force=True)
+        self._flush_all()
         self._raise_pending()
+
+    def _flush_all(self) -> None:
+        """Sends batches until the queue is empty or a send fails. A single
+        `_flush` sends at most `batch_size` events, so a one-shot call would
+        silently strand the rest of a backlog at shutdown."""
+        ok = self._flush(force=True)
+        while ok and not self._queue.empty():
+            ok = self._flush(force=True)
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            # The first tick is a forced heartbeat so the server-reported
-            # staleness window sizes the interval before the first idle wait.
-            self._flush(force=self._first_tick)
+            backlog = False
+            try:
+                # The first tick is a forced heartbeat so the server-reported
+                # staleness window sizes the interval before the first idle wait.
+                ok = self._flush(force=self._first_tick)
+                backlog = ok and not self._queue.empty()
+            except Exception:  # noqa: BLE001 -- the exporter thread must never die
+                _log.exception("telemetry exporter iteration failed; will retry")
             self._first_tick = False
-            self._stop_event.wait(min(self._flush_interval, self._heartbeat_interval))
+            # A backlog is drained back to back; only an idle queue waits.
+            if not backlog:
+                self._stop_event.wait(min(self._flush_interval, self._heartbeat_interval))
 
     def _drain(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -337,12 +372,14 @@ class TelemetryExporter:
                 break
         return events
 
-    def _flush(self, *, force: bool = False) -> None:
+    def _flush(self, *, force: bool = False) -> bool:
+        """Sends one batch. Returns False if the send failed (the batch is
+        re-queued, or dropped when the server rejected it outright)."""
         now = time.monotonic()
         events = self._drain()
         due_for_heartbeat = (now - self._last_flush_monotonic) >= self._heartbeat_interval
         if not events and not due_for_heartbeat and not force:
-            return
+            return True
         self._last_flush_monotonic = now
         try:
             # call_with_retry() re-handshakes exactly once if the session
@@ -369,12 +406,24 @@ class TelemetryExporter:
             # never blocked; without it the error is stored and raised on
             # the caller's next submit()/flush_now()/stop() instead of
             # killing this thread (which silently stopped heartbeats).
-            for event in events:
-                self._requeue(event)
+            permanent = _is_permanent_rejection(exc)
+            if permanent:
+                # Re-sending a batch the server refuses on its merits would wedge
+                # the exporter behind it forever; drop it and keep going.
+                self.dropped_count += len(events)
+                _log.warning("telemetry batch of %d rejected and dropped: %s", len(events), exc)
+            else:
+                for event in events:
+                    self._requeue(event)
             if not self._fail_open:
                 _log.warning("telemetry flush failed (fail_open=False): %s", exc)
                 self.last_error = exc
-            return
+            return permanent
+        except Exception:  # noqa: BLE001 -- e.g. a malformed response; never lose the batch
+            _log.exception("telemetry flush failed unexpectedly; batch re-queued")
+            for event in events:
+                self._requeue(event)
+            return False
         heartbeat = (resp.data or {}).get("heartbeat") if isinstance(resp.data, dict) else None
         if heartbeat:
             self.state.update_from_heartbeat(heartbeat)
@@ -383,6 +432,7 @@ class TelemetryExporter:
                     float(self.state.telemetry_staleness_minutes)
                 )
             self._maybe_notify_suspend()
+        return True
 
     def _requeue(self, event: dict[str, Any]) -> None:
         try:
@@ -392,12 +442,20 @@ class TelemetryExporter:
 
     def _maybe_notify_suspend(self) -> None:
         with self._state_lock:
-            if self.state.is_suspended and not self._suspend_notified:
-                self._suspend_notified = True
-                if self._on_suspend:
-                    self._on_suspend(self.state)
-            elif not self.state.is_suspended:
+            if not self.state.is_suspended:
                 self._suspend_notified = False
+                return
+            if self._suspend_notified:
+                return
+            self._suspend_notified = True
+            callback = self._on_suspend
+        # Outside the lock, and isolated: a user callback must not be able to
+        # deadlock or kill the exporter thread.
+        if callback:
+            try:
+                callback(self.state)
+            except Exception:  # noqa: BLE001
+                _log.exception("on_suspend callback raised")
 
     def is_suspended(self) -> bool:
         return self.state.is_suspended
@@ -470,11 +528,14 @@ class AsyncTelemetryExporter:
         self._stop_event.set()
         try:
             await asyncio.wait_for(self._task, timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._task.cancel()
         self._task = None
-        await self._flush(force=True)
+        await self._flush_all()
         self._raise_pending()
+
+    def set_on_suspend(self, callback: Callable[[GovernanceState], None] | None) -> None:
+        self._on_suspend = callback
 
     def _raise_pending(self) -> None:
         if self._fail_open or self.last_error is None:
@@ -500,20 +561,36 @@ class AsyncTelemetryExporter:
                 self.dropped_count += 1
 
     async def flush_now(self) -> None:
-        await self._flush(force=True)
+        await self._flush_all()
         self._raise_pending()
+
+    async def _flush_all(self) -> None:
+        """See TelemetryExporter._flush_all()."""
+        self._ensure_bound()
+        assert self._queue is not None
+        ok = await self._flush(force=True)
+        while ok and not self._queue.empty():
+            ok = await self._flush(force=True)
 
     async def _run(self) -> None:
         assert self._stop_event is not None
+        assert self._queue is not None
         while not self._stop_event.is_set():
-            await self._flush(force=self._first_tick)
+            backlog = False
+            try:
+                ok = await self._flush(force=self._first_tick)
+                backlog = ok and not self._queue.empty()
+            except Exception:  # noqa: BLE001 -- the exporter task must never die
+                _log.exception("telemetry exporter iteration failed; will retry")
             self._first_tick = False
+            if backlog:
+                continue
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
                     timeout=min(self._flush_interval, self._heartbeat_interval),
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     def _drain(self) -> list[dict[str, Any]]:
@@ -526,13 +603,14 @@ class AsyncTelemetryExporter:
                 break
         return events
 
-    async def _flush(self, *, force: bool = False) -> None:
+    async def _flush(self, *, force: bool = False) -> bool:
+        """See TelemetryExporter._flush()."""
         self._ensure_bound()
         now = time.monotonic()
         events = self._drain()
         due_for_heartbeat = (now - self._last_flush_monotonic) >= self._heartbeat_interval
         if not events and not due_for_heartbeat and not force:
-            return
+            return True
         self._last_flush_monotonic = now
         try:
             # See the sync exporter's _flush() for why this goes through
@@ -548,16 +626,20 @@ class AsyncTelemetryExporter:
                 )
             )
         except GatewayError as exc:
-            assert self._queue is not None
-            for event in events:
-                try:
-                    self._queue.put_nowait(event)
-                except asyncio.QueueFull:
-                    self.dropped_count += 1
+            permanent = _is_permanent_rejection(exc)
+            if permanent:
+                self.dropped_count += len(events)
+                _log.warning("telemetry batch of %d rejected and dropped: %s", len(events), exc)
+            else:
+                self._requeue(events)
             if not self._fail_open:
                 _log.warning("telemetry flush failed (fail_open=False): %s", exc)
                 self.last_error = exc
-            return
+            return permanent
+        except Exception:  # noqa: BLE001 -- e.g. a malformed response; never lose the batch
+            _log.exception("telemetry flush failed unexpectedly; batch re-queued")
+            self._requeue(events)
+            return False
         heartbeat = (resp.data or {}).get("heartbeat") if isinstance(resp.data, dict) else None
         if heartbeat:
             self.state.update_from_heartbeat(heartbeat)
@@ -566,14 +648,28 @@ class AsyncTelemetryExporter:
                     float(self.state.telemetry_staleness_minutes)
                 )
             self._maybe_notify_suspend()
+        return True
+
+    def _requeue(self, events: list[dict[str, Any]]) -> None:
+        assert self._queue is not None
+        for event in events:
+            try:
+                self._queue.put_nowait(event)
+            except asyncio.QueueFull:
+                self.dropped_count += 1
 
     def _maybe_notify_suspend(self) -> None:
-        if self.state.is_suspended and not self._suspend_notified:
-            self._suspend_notified = True
-            if self._on_suspend:
-                self._on_suspend(self.state)
-        elif not self.state.is_suspended:
+        if not self.state.is_suspended:
             self._suspend_notified = False
+            return
+        if self._suspend_notified:
+            return
+        self._suspend_notified = True
+        if self._on_suspend:
+            try:
+                self._on_suspend(self.state)
+            except Exception:  # noqa: BLE001 -- a user callback must not kill the exporter
+                _log.exception("on_suspend callback raised")
 
     def is_suspended(self) -> bool:
         return self.state.is_suspended
