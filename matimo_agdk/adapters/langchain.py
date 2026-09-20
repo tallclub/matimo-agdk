@@ -96,24 +96,38 @@ when available. Spans correlate via the framework's own `run_id`/
 `parent_run_id` UUID chain: the root of that chain becomes the emitted
 `run_id`, and each node's own `run_id` becomes its `span_id` -- so an
 agent's chain-start, its LLM calls, and its tool calls all land under one
-`run_id` in Matimo's telemetry, without the caller needing to wrap
-anything in `governor.run()` (though doing so still works and is
-respected for spans emitted outside these callbacks).
+`run_id` in Matimo's telemetry.
+
+## Run lifecycle
+
+Gateway only ends a run on an explicit terminal `kind:"run"` span
+(docs/SERVER-CONTRACT.md 7.3), so who owns the run matters:
+
+- Inside a `governor.run()` block, every span the handler emits joins that
+  run (`governor.run()` opens and closes it). Separate `.invoke()` calls in
+  one block therefore show up as one run, not one run each.
+- Outside one, the handler opens a run for each parentless chain/LLM/tool
+  call (`status="running"`) and closes it `completed`, or `failed` if that
+  call raises. Without this, each such call left a run `running` until the
+  staleness sweep.
 """
 
 from __future__ import annotations
 
 import functools
 import time
+from contextvars import ContextVar
 from typing import Any
 from uuid import UUID
 
+from ..governor import current_run_id
 from ._shared import (
     Mode,
     async_check_and_wait,
     async_raise_if_suspended,
     call_args_from,
     check_mode,
+    default_llm_headers,
     emit_llm_span,
     emit_tool_span,
     sync_check_and_wait,
@@ -133,6 +147,25 @@ except ImportError as exc:  # pragma: no cover - exercised only when the extra i
 
 def _now() -> float:
     return time.monotonic()
+
+
+# The id of the tool whose governed call is in progress in this context. A tool
+# without its own coroutine has its async call routed by LangChain through the
+# (already wrapped) `_run` in an executor thread, which copies this context; the
+# inner wrapper sees its own id here and skips, so one call is checked once and
+# a PENDING approval is requested once, not twice.
+_GOVERNED_TOOL: ContextVar[int | None] = ContextVar("matimo_agdk_langchain_governed", default=None)
+
+
+def _node_name(serialized: dict[str, Any] | None, kwargs: dict[str, Any]) -> str | None:
+    """A readable name for the run a root LangChain node opens: the explicit
+    `name` LangChain passes, else the serialized `name`, else its class name."""
+    name = kwargs.get("name") or (serialized or {}).get("name")
+    if not name:
+        ident = (serialized or {}).get("id")
+        if isinstance(ident, list) and ident:
+            name = ident[-1]
+    return str(name) if name else None
 
 
 def _usage_from_llm_output(llm_output: dict[str, Any] | None) -> dict[str, Any]:
@@ -157,12 +190,19 @@ class _RunTree:
         self._root_of: dict[UUID, str] = {}
         self._started_at: dict[UUID, float] = {}
 
-    def start(self, run_id: UUID, parent_run_id: UUID | None) -> str:
+    def start(
+        self, run_id: UUID, parent_run_id: UUID | None, ambient: str | None = None
+    ) -> tuple[str, bool]:
+        """Returns `(root, owned)`. A node under a known parent joins that
+        parent's run; a parentless node joins the caller's ambient
+        `governor.run()` if there is one; otherwise it is the root of a run
+        of its own (`owned`), which the caller must open and close."""
         root = self._root_of.get(parent_run_id) if parent_run_id else None
-        root = root or str(run_id)
+        owned = root is None and ambient is None
+        root = root or ambient or str(run_id)
         self._root_of[run_id] = root
         self._started_at[run_id] = _now()
-        return root
+        return root, owned
 
     def finish(self, run_id: UUID) -> tuple[str, int]:
         root = self._root_of.pop(run_id, str(run_id))
@@ -179,15 +219,52 @@ class _LangChainSpans:
         self.governor = governor
         self.mode: Mode = check_mode(mode)
         self.tree = _RunTree()
+        # Runs this handler opened itself (no parent, no ambient governor.run()),
+        # keyed by the root node's LangChain run_id -> (name, started).
+        self._owned: dict[UUID, tuple[str, float]] = {}
 
-    def on_chain_start(self, run_id: UUID, parent_run_id: UUID | None) -> None:
-        self.tree.start(run_id, parent_run_id)
+    def _start(self, run_id: UUID, parent_run_id: UUID | None, name: str | None) -> None:
+        root, owned = self.tree.start(run_id, parent_run_id, ambient=current_run_id())
+        if not owned:
+            return
+        run_name = name or "langchain-run"
+        self._owned[run_id] = (run_name, _now())
+        try:
+            self.governor.run_span(root, status="running", name=run_name)
+        except Exception:  # noqa: BLE001 -- telemetry must never break the caller's agent
+            pass
 
-    def on_chain_end(self, run_id: UUID) -> None:
+    def _close(self, run_id: UUID, status: str) -> None:
+        # Gateway only ends a run on an explicit terminal `kind:"run"` span
+        # (docs/SERVER-CONTRACT.md 7.3); without this a run this handler opened
+        # stays `running` until the staleness sweep.
+        opened = self._owned.pop(run_id, None)
+        if opened is None:
+            return
+        name, started = opened
+        try:
+            self.governor.run_span(
+                str(run_id),
+                status="completed" if status == "completed" else "failed",
+                name=name,
+                duration_ms=int((_now() - started) * 1000),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_chain_start(
+        self, run_id: UUID, parent_run_id: UUID | None, name: str | None = None
+    ) -> None:
+        self._start(run_id, parent_run_id, name)
+
+    def on_chain_end(self, run_id: UUID, status: str = "completed") -> None:
         self.tree.finish(run_id)
+        self._close(run_id, status)
 
-    def on_llm_start(self, run_id: UUID, parent_run_id: UUID | None) -> None:
-        self.tree.start(run_id, parent_run_id)
+    def on_llm_start(
+        self, run_id: UUID, parent_run_id: UUID | None, name: str | None = None
+    ) -> None:
+        self._start(run_id, parent_run_id, name)
 
     def on_llm_end(
         self,
@@ -212,9 +289,12 @@ class _LangChainSpans:
             duration_ms=duration_ms,
             attributes=attrs or None,
         )
+        self._close(run_id, status)
 
-    def on_tool_start(self, run_id: UUID, parent_run_id: UUID | None) -> None:
-        self.tree.start(run_id, parent_run_id)
+    def on_tool_start(
+        self, run_id: UUID, parent_run_id: UUID | None, name: str | None = None
+    ) -> None:
+        self._start(run_id, parent_run_id, name)
 
     def on_tool_end(
         self,
@@ -237,6 +317,7 @@ class _LangChainSpans:
             call_id=str(run_id),
             result=truncate(result) if result is not None else None,
         )
+        self._close(run_id, status)
 
 
 def _extract_finish_reasons(response: Any) -> list[str] | None:
@@ -277,7 +358,7 @@ class MatimoCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        self._impl.on_chain_start(run_id, parent_run_id)
+        self._impl.on_chain_start(run_id, parent_run_id, _node_name(serialized, kwargs))
 
     def on_chain_end(
         self,
@@ -288,6 +369,18 @@ class MatimoCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         **kwargs: Any,
     ) -> None:
         self._impl.on_chain_end(run_id)
+
+    def on_chain_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # A chain that raises fires on_chain_error, never on_chain_end; without
+        # this its run-tree entry would be retained for the life of the process.
+        self._impl.on_chain_end(run_id, status="error")
 
     def on_llm_start(
         self,
@@ -300,7 +393,7 @@ class MatimoCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
     ) -> None:
         if self.mode == "govern":
             sync_raise_if_suspended(self.governor)
-        self._impl.on_llm_start(run_id, parent_run_id)
+        self._impl.on_llm_start(run_id, parent_run_id, _node_name(serialized, kwargs))
 
     def on_chat_model_start(
         self,
@@ -313,7 +406,7 @@ class MatimoCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
     ) -> None:
         if self.mode == "govern":
             sync_raise_if_suspended(self.governor)
-        self._impl.on_llm_start(run_id, parent_run_id)
+        self._impl.on_llm_start(run_id, parent_run_id, _node_name(serialized, kwargs))
 
     def on_llm_end(
         self, response: Any, *, run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any
@@ -352,7 +445,7 @@ class MatimoCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
     ) -> None:
         if self.mode == "govern":
             sync_raise_if_suspended(self.governor)
-        self._impl.on_tool_start(run_id, parent_run_id)
+        self._impl.on_tool_start(run_id, parent_run_id, _node_name(serialized, kwargs))
 
     def on_tool_end(
         self, output: Any, *, run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any
@@ -397,7 +490,7 @@ class AsyncMatimoCallbackHandler(AsyncCallbackHandler):  # type: ignore[misc]
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        self._impl.on_chain_start(run_id, parent_run_id)
+        self._impl.on_chain_start(run_id, parent_run_id, _node_name(serialized, kwargs))
 
     async def on_chain_end(
         self,
@@ -408,6 +501,16 @@ class AsyncMatimoCallbackHandler(AsyncCallbackHandler):  # type: ignore[misc]
         **kwargs: Any,
     ) -> None:
         self._impl.on_chain_end(run_id)
+
+    async def on_chain_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._impl.on_chain_end(run_id, status="error")
 
     async def on_llm_start(
         self,
@@ -420,7 +523,7 @@ class AsyncMatimoCallbackHandler(AsyncCallbackHandler):  # type: ignore[misc]
     ) -> None:
         if self.mode == "govern":
             await async_raise_if_suspended(self.governor)
-        self._impl.on_llm_start(run_id, parent_run_id)
+        self._impl.on_llm_start(run_id, parent_run_id, _node_name(serialized, kwargs))
 
     async def on_chat_model_start(
         self,
@@ -433,7 +536,7 @@ class AsyncMatimoCallbackHandler(AsyncCallbackHandler):  # type: ignore[misc]
     ) -> None:
         if self.mode == "govern":
             await async_raise_if_suspended(self.governor)
-        self._impl.on_llm_start(run_id, parent_run_id)
+        self._impl.on_llm_start(run_id, parent_run_id, _node_name(serialized, kwargs))
 
     async def on_llm_end(
         self, response: Any, *, run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any
@@ -472,7 +575,7 @@ class AsyncMatimoCallbackHandler(AsyncCallbackHandler):  # type: ignore[misc]
     ) -> None:
         if self.mode == "govern":
             await async_raise_if_suspended(self.governor)
-        self._impl.on_tool_start(run_id, parent_run_id)
+        self._impl.on_tool_start(run_id, parent_run_id, _node_name(serialized, kwargs))
 
     async def on_tool_end(
         self, output: Any, *, run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any
@@ -497,10 +600,12 @@ class AsyncMatimoCallbackHandler(AsyncCallbackHandler):  # type: ignore[misc]
 
 
 def _wrap_sync_run(
-    inner: Any, tool_name: str, governor: Any, mode: Mode, category: str | None
+    inner: Any, tool_name: str, governor: Any, mode: Mode, category: str | None, tool_id: int
 ) -> Any:
     @functools.wraps(inner)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if _GOVERNED_TOOL.get() == tool_id:
+            return inner(*args, **kwargs)  # already governed by the async wrapper above us
         call_args = call_args_from(args, kwargs, exclude=("run_manager", "config"))
         if mode == "govern":
             sync_raise_if_suspended(governor)
@@ -540,10 +645,12 @@ def _wrap_sync_run(
 
 
 def _wrap_async_run(
-    inner: Any, tool_name: str, governor: Any, mode: Mode, category: str | None
+    inner: Any, tool_name: str, governor: Any, mode: Mode, category: str | None, tool_id: int
 ) -> Any:
     @functools.wraps(inner)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if _GOVERNED_TOOL.get() == tool_id:
+            return await inner(*args, **kwargs)
         call_args = call_args_from(args, kwargs, exclude=("run_manager", "config"))
         if mode == "govern":
             await async_raise_if_suspended(governor)
@@ -555,12 +662,14 @@ def _wrap_async_run(
                 raise ToolException(decision.reason)
         started = _now()
         status = "completed"
+        marker = _GOVERNED_TOOL.set(tool_id)
         try:
             return await inner(*args, **kwargs)
         except Exception:
             status = "error"
             raise
         finally:
+            _GOVERNED_TOOL.reset(marker)
             emit_tool_span(
                 governor,
                 tool_name,
@@ -602,20 +711,23 @@ def govern_tools(
     """
     check_mode(mode)
     for t in tools:
+        if getattr(t, "_matimo_governed", False):
+            continue  # govern_tools() twice must not stack two checks on one call
         name = getattr(t, "name", None) or type(t).__name__
+        tool_id = id(t)
         base_run = getattr(t, "_run", None)
         if base_run is not None:
-            t._run = _wrap_sync_run(base_run, name, governor, mode, category)  # noqa: SLF001
-
-        # Only wrap _arun if the tool overrides the BaseTool default (the
-        # default _arun already delegates to _run via a thread, so
-        # wrapping both would double-check the same call).
-        defines_own_arun = "_arun" in type(t).__dict__ or any(
-            "_arun" in base.__dict__ for base in type(t).__mro__[1:-1]
-        )
+            t._run = _wrap_sync_run(base_run, name, governor, mode, category, tool_id)  # noqa: SLF001
         base_arun = getattr(t, "_arun", None)
-        if defines_own_arun and base_arun is not None:
-            t._arun = _wrap_async_run(base_arun, name, governor, mode, category)  # noqa: SLF001
+        if base_arun is not None:
+            # Wrapped unconditionally; the _GOVERNED_TOOL marker makes the inner
+            # `_run` wrapper step aside when LangChain's default `_arun` (or a
+            # StructuredTool without a coroutine) routes back through it.
+            t._arun = _wrap_async_run(base_arun, name, governor, mode, category, tool_id)  # noqa: SLF001
+        try:
+            t._matimo_governed = True  # noqa: SLF001
+        except Exception:  # noqa: BLE001 -- a stricter model config may reject this; harmless
+            pass
     return tools
 
 
@@ -629,12 +741,14 @@ def gateway_chat_model(
     """Returns a `ChatOpenAI` (provider="openai", default) or
     `ChatAnthropic` (provider="anthropic") already pointed at Gateway.
 
-    `provider="openai"` -> full support: the session token *and* a fresh
-    `Matimo-Agent-Signature` are attached per request, via
-    `governor.httpx_client()`'s request event hook
-    (`ChatOpenAI.http_client`/`http_async_client` are real, documented
-    constructor kwargs in langchain-openai>=1.6, verified directly against
-    the installed package's pydantic fields).
+    `provider="openai"` -> full support for synchronous calls: the session
+    token *and* a fresh `Matimo-Agent-Signature` are attached per request, via
+    `governor.httpx_client()`'s request event hook (`ChatOpenAI.http_client`
+    is a real, documented constructor kwarg in langchain-openai>=1.6, verified
+    directly against the installed package's pydantic fields). Only the sync
+    `http_client` is wired: `ChatOpenAI`'s async methods (`ainvoke`, `astream`)
+    use its own async client with a session header fixed at construction, and
+    no signature. Needs a sync `Governor`.
 
     `provider="anthropic"` -> **session-header-only, signing effectively
     off.** `langchain-anthropic==1.7.2`'s `ChatAnthropic` builds its own
@@ -657,11 +771,12 @@ def gateway_chat_model(
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
+        default_headers = default_llm_headers(governor, "gateway_chat_model")
         return ChatOpenAI(
             model=model or "matimo/auto",
             base_url=governor.config.base_url,
             api_key=governor.config.api_key,
-            default_headers=governor.openai_client_kwargs()["default_headers"],
+            default_headers=default_headers,
             http_client=governor.httpx_client(),
             **kwargs,
         )
@@ -672,6 +787,7 @@ def gateway_chat_model(
         # ignores) but not auth_token, so the org key travels in an explicit
         # Authorization header instead; api_key is a placeholder that keeps
         # the SDK's own "credentials present" check happy.
+        default_llm_headers(governor, "gateway_chat_model")  # rejects an AsyncGovernor clearly
         headers = dict(governor.anthropic_client_kwargs()["default_headers"])
         headers["Authorization"] = f"Bearer {governor.config.api_key}"
         return ChatAnthropic(  # type: ignore[call-arg]
