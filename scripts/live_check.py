@@ -1323,7 +1323,9 @@ def scenario_anthropic_auth(ctx: Ctx) -> None:
     gov.start()
     try:
         with gov.run("live-check-anthropic-auth"):
-            client = anthropic.Anthropic(**gov.anthropic_client_kwargs(), http_client=gov.httpx_client())
+            client = anthropic.Anthropic(
+                **gov.anthropic_client_kwargs(), http_client=gov.anthropic_http_client()
+            )
             try:
                 client.messages.create(
                     model=GATEWAY_MODEL or "claude-3-5-haiku-latest",

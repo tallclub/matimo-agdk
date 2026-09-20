@@ -19,7 +19,7 @@ no change needed at any LLM-SDK call site.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -31,8 +31,10 @@ SESSION_TOKEN_HEADER = "X-Matimo-Session-Token"
 SIGNATURE_HEADER = "Matimo-Agent-Signature"
 
 
-def _is_session_expired_body(response: httpx.Response) -> bool:
-    """Callers must have already called response.read()/aread() -- reading
+def _is_session_expired_body(response: Any) -> bool:
+    """`response` is an httpx or httpx2 Response (duck-typed: this module and
+    _retry_transport_httpx2 share it). Callers must have already called
+    response.read()/aread() -- reading
     the body is only safe to do unconditionally on a 401 (status/headers are
     available without reading); a 200 streaming response must never be
     read here, or streaming would break."""
@@ -43,7 +45,7 @@ def _is_session_expired_body(response: httpx.Response) -> bool:
     return isinstance(body, dict) and body.get("error") == "session_expired"
 
 
-def _resign(request: httpx.Request, signer: JWSSigner, *, signing_enabled: bool) -> None:
+def _resign(request: Any, signer: JWSSigner, *, signing_enabled: bool) -> None:
     if not signing_enabled:
         return
     jws = signer.sign_request(body_bytes=request.content or b"")
