@@ -52,7 +52,8 @@ class GatewayConfig(BaseModel):
     read_timeout: float = Field(default=30.0, gt=0)
 
     telemetry_flush_interval: float = Field(default=5.0, gt=0)
-    telemetry_batch_size: int = Field(default=50, ge=1)
+    # The server accepts at most 500 events per batch and rejects a larger one whole.
+    telemetry_batch_size: int = Field(default=50, ge=1, le=500)
     telemetry_queue_max: int = Field(default=2000, ge=1)
     # None means "compute from the server-reported staleness window at
     # runtime" -- see resolved_heartbeat_interval().

@@ -16,6 +16,8 @@ not catch an arbitrary password in prose.
 
 from __future__ import annotations
 
+import datetime as dt
+import math
 import re
 from typing import Any
 
@@ -93,10 +95,32 @@ def redact(value: Any, *, max_string: int = DEFAULT_MAX_STRING, _depth: int = 0)
             else:
                 out[key] = redact(v, max_string=max_string, _depth=_depth + 1)
         return out
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, set, frozenset)):
         return [redact(v, max_string=max_string, _depth=_depth + 1) for v in value]
     if isinstance(value, str):
         value = scrub_string(value)
         if len(value) > max_string:
             return value[:max_string] + "...[TRUNCATED]"
-    return value
+        return value
+    return _json_safe(value, max_string)
+
+
+def _json_safe(value: Any, max_string: int) -> Any:
+    """A non-container, non-string value as something `json.dumps` accepts.
+
+    A tool argument or result is whatever the tool's caller passed: a datetime, a
+    Path, a UUID, an object, NaN. Left as-is it made the request body unserializable,
+    which broke `guard()` before the tool ran and, in telemetry, re-queued the same
+    batch forever. Anything that is not already JSON is sent as its text."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, (dt.datetime, dt.date, dt.time)):
+        return value.isoformat()
+    try:
+        text = str(value)
+    except Exception:  # noqa: BLE001 -- a hostile __str__ must not break a tool call
+        text = f"<{type(value).__name__}>"
+    text = scrub_string(text)
+    return text if len(text) <= max_string else text[:max_string] + "...[TRUNCATED]"

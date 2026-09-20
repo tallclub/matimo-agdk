@@ -35,6 +35,13 @@ Kind = Literal["run", "llm", "tool", "log", "error"]
 
 _MAX_ATTRIBUTE_VALUE_LEN = 2000
 
+# The server validates a whole batch at once (telemetryBatchSchema): one event over
+# a limit makes it answer 400 for every event in the batch, and a 400 batch is dropped.
+# These are its limits (docs/SERVER-CONTRACT.md 7.1; contract-tested in tests/contract).
+_MAX_ID_LEN = 120
+_MAX_NAME_LEN = 255
+_MAX_STATUS_LEN = 20
+
 # 4xx statuses that mean "this request as sent will never be accepted".
 # 401/403 (session/auth/policy), 408 and 429 are excluded: those are about the
 # sender's state or a passing condition, so the same batch may succeed later.
@@ -117,21 +124,23 @@ def build_event(
     duration_ms: int | None = None,
     attributes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    event: dict[str, Any] = {"runId": run_id, "kind": kind}
+    event: dict[str, Any] = {"runId": str(run_id)[:_MAX_ID_LEN], "kind": kind}
     if session_id is not None:
-        event["sessionId"] = session_id
+        event["sessionId"] = str(session_id)[:_MAX_ID_LEN]
     if span_id is not None:
-        event["spanId"] = span_id
+        event["spanId"] = str(span_id)[:_MAX_ID_LEN]
     if parent_span_id is not None:
-        event["parentSpanId"] = parent_span_id
+        event["parentSpanId"] = str(parent_span_id)[:_MAX_ID_LEN]
     if name is not None:
-        event["name"] = name
+        event["name"] = str(name)[:_MAX_NAME_LEN]
     if status is not None:
-        event["status"] = status
+        event["status"] = str(status)[:_MAX_STATUS_LEN]
     if started_at is not None:
         event["startedAt"] = started_at
     if duration_ms is not None:
-        event["durationMs"] = duration_ms
+        # The server wants a non-negative integer; a float or a negative would 400
+        # the whole batch.
+        event["durationMs"] = max(0, int(duration_ms))
     if attributes:
         event["attributes"] = redact_attributes(attributes)
     return event
