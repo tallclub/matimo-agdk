@@ -32,18 +32,24 @@ Two supporting design decisions apply across every adapter:
    derived from the framework's own run/invocation identifier when one is
    available (so LLM and tool spans across one agent turn correlate
    automatically, matching the server's `runId`/`spanId`/`parentSpanId`
-   shape), and fall back to a freshly generated id per call otherwise --
-   telemetry is emitted either way, just without cross-call correlation in
-   that fallback case.
+   shape). With no explicit id and no ambient `governor.run()`, a span gets a
+   one-span run of its own that is opened and closed around it, exactly as
+   `Governor.guard()` does for a tool call outside a run -- telemetry is
+   emitted either way, just without cross-call correlation. Gateway only ends
+   a run on an explicit terminal run span (docs/SERVER-CONTRACT.md 7.3), so a
+   bare span under a fresh id would stay `running` until the staleness sweep.
+   Wrap the framework call in `governor.run()` to group its spans instead.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 import uuid
 from typing import Any, Literal
 
+from ..governor import current_run_id
 from ..tools import ToolDecision
 
 Mode = Literal["observe", "govern"]
@@ -82,7 +88,12 @@ def call_args_from(
 
 
 def sync_check_and_wait(
-    governor: Any, tool_name: str, args: dict[str, Any], *, category: str | None = None
+    governor: Any,
+    tool_name: str,
+    args: dict[str, Any],
+    *,
+    category: str | None = None,
+    run_id: str | None = None,
 ) -> ToolDecision:
     """Blocking check-then-await-PENDING, for a sync Governor called from
     sync framework code. Raises TypeError if handed an AsyncGovernor."""
@@ -93,12 +104,19 @@ def sync_check_and_wait(
         )
     decision = governor.check_and_wait(tool_name, args, category_hint=category)
     if decision.denied:
-        emit_tool_span(governor, tool_name, status="denied", duration_ms=0, arguments=args)
+        emit_tool_span(
+            governor, tool_name, run_id=run_id, status="denied", duration_ms=0, arguments=args
+        )
     return decision
 
 
 async def async_check_and_wait(
-    governor: Any, tool_name: str, args: dict[str, Any], *, category: str | None = None
+    governor: Any,
+    tool_name: str,
+    args: dict[str, Any],
+    *,
+    category: str | None = None,
+    run_id: str | None = None,
 ) -> ToolDecision:
     """Non-blocking check-then-await-PENDING for async framework code.
     Awaits directly if `governor` is an AsyncGovernor; otherwise bridges
@@ -111,7 +129,9 @@ async def async_check_and_wait(
             governor.check_and_wait, tool_name, args, category_hint=category
         )
     if decision.denied:
-        emit_tool_span(governor, tool_name, status="denied", duration_ms=0, arguments=args)
+        emit_tool_span(
+            governor, tool_name, run_id=run_id, status="denied", duration_ms=0, arguments=args
+        )
     return decision
 
 
@@ -131,30 +151,84 @@ async def async_raise_if_suspended(governor: Any) -> None:
         await asyncio.to_thread(governor.raise_if_suspended)
 
 
+def _in_own_run(governor: Any, name: str, status: Any, emit: Any) -> None:
+    """Emits one span inside a run of its own, opened before and closed after.
+
+    For a span with no explicit run id and no ambient `governor.run()`. The
+    open, the span and the close are each best-effort and independent, so a
+    governor without `run_span()` (a test double) or a telemetry hiccup loses
+    at most that one event, never the caller's agent."""
+    run_id = new_run_id()
+    started = time.monotonic()
+    try:
+        governor.run_span(run_id, status="running", name=name)
+    except Exception:  # noqa: BLE001 -- telemetry must never break the caller's agent
+        pass
+    try:
+        emit(run_id)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        governor.run_span(
+            run_id,
+            status="completed" if status == "completed" else "failed",
+            name=name,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def emit_llm_span(governor: Any, *, run_id: str | None = None, **kwargs: Any) -> None:
-    """governor.llm_span() with a graceful fallback to a fresh run_id when
-    no explicit one is given and no `governor.run()` block is active."""
+    """governor.llm_span() under `run_id`, else the ambient `governor.run()`,
+    else a one-span run of its own (see this module's docstring)."""
+    if run_id is None and current_run_id() is None:
+        _in_own_run(
+            governor,
+            str(kwargs.get("model") or "llm-call"),
+            kwargs.get("status"),
+            lambda rid: governor.llm_span(run_id=rid, **kwargs),
+        )
+        return
     try:
         governor.llm_span(run_id=run_id, **kwargs)
     except Exception:  # noqa: BLE001 -- telemetry must never break the caller's agent
-        if run_id is None:
-            try:
-                governor.llm_span(run_id=new_run_id(), **kwargs)
-            except Exception:  # noqa: BLE001
-                pass
+        pass
 
 
 def emit_tool_span(
     governor: Any, tool_name: str, *, run_id: str | None = None, **kwargs: Any
 ) -> None:
+    """governor.tool_span() under `run_id`, else the ambient `governor.run()`,
+    else a one-span run of its own (see this module's docstring)."""
+    if run_id is None and current_run_id() is None:
+        _in_own_run(
+            governor,
+            f"tool:{tool_name}",
+            kwargs.get("status"),
+            lambda rid: governor.tool_span(tool_name, run_id=rid, **kwargs),
+        )
+        return
     try:
         governor.tool_span(tool_name, run_id=run_id, **kwargs)
     except Exception:  # noqa: BLE001
-        if run_id is None:
-            try:
-                governor.tool_span(tool_name, run_id=new_run_id(), **kwargs)
-            except Exception:  # noqa: BLE001
-                pass
+        pass
+
+
+def default_llm_headers(governor: Any, helper: str) -> dict[str, str]:
+    """The session/run headers a `gateway_*` helper bakes into a client it
+    builds synchronously. An AsyncGovernor cannot supply them (its session
+    handshake must be awaited), so fail with a message that says what to do
+    instead of an opaque "'coroutine' object is not subscriptable"."""
+    if is_async_governor(governor):
+        raise TypeError(
+            f"{helper}() builds its client synchronously, so it needs a sync Governor "
+            "(Governor.from_env()); an AsyncGovernor must await its session handshake. "
+            "A sync Governor still serves async framework code. For AutoGen use "
+            "gateway_model_client(), which does take an AsyncGovernor."
+        )
+    headers: dict[str, str] = governor.openai_client_kwargs()["default_headers"]
+    return headers
 
 
 def truncate(value: Any, limit: int = 500) -> str:

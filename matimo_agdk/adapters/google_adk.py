@@ -90,6 +90,7 @@ from ._shared import (
     async_check_and_wait,
     async_raise_if_suspended,
     check_mode,
+    default_llm_headers,
     emit_llm_span,
     emit_tool_span,
     truncate,
@@ -124,10 +125,18 @@ def _usage_attributes(usage_metadata: Any) -> dict[str, Any]:
 class MatimoPlugin(BasePlugin):  # type: ignore[misc]
     """The one entry point: `Runner(plugins=[MatimoPlugin(governor)])`."""
 
-    def __init__(self, governor: Any, mode: Mode = "govern", *, name: str = "matimo") -> None:
+    def __init__(
+        self,
+        governor: Any,
+        mode: Mode = "govern",
+        *,
+        category: str | None = None,
+        name: str = "matimo",
+    ) -> None:
         super().__init__(name)
         self.governor = governor
         self.mode: Mode = check_mode(mode)
+        self.category = category
         self._pending_llm: dict[str, tuple[str, float, str | None]] = {}
         self._previous_run: dict[str, str | None] = {}
         self._pending_tool: dict[str, tuple[float, str | None]] = {}
@@ -245,7 +254,16 @@ class MatimoPlugin(BasePlugin):  # type: ignore[misc]
             return None
 
         await async_raise_if_suspended(self.governor)
-        decision = await async_check_and_wait(self.governor, tool.name, dict(tool_args))
+        # The denied span must land in ADK's own run (the invocation), not a
+        # run of its own: bind_run_id() only covers model calls.
+        invocation_id = getattr(tool_context, "invocation_id", None)
+        decision = await async_check_and_wait(
+            self.governor,
+            tool.name,
+            dict(tool_args),
+            category=self.category,
+            run_id=invocation_id or None,
+        )
         if decision.denied:
             # ADK's documented contract: a non-None dict from
             # before_tool_callback short-circuits dispatch and becomes the
@@ -338,7 +356,7 @@ def gateway_model(governor: Any, *, model: str | None = None, **kwargs: Any) -> 
     """
     from google.adk.models.lite_llm import LiteLlm
 
-    headers = governor.openai_client_kwargs()["default_headers"]
+    headers = default_llm_headers(governor, "gateway_model")
     model_name = model or "matimo/auto"
     return LiteLlm(
         model=f"openai/{model_name}",

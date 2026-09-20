@@ -66,13 +66,14 @@ AutoGen itself already computed.
 many agents/teams use it -- AutoGen gives this wrapper no natural
 per-chat/per-run id the way ADK's invocation_id or LangChain's
 run_id/parent_run_id tree does. Every span here (LLM and tool alike) uses
-the ambient `governor.run()` id when one is active, and otherwise falls
-back to a fresh, uncorrelated id per call -- the same fallback
-`emit_llm_span()`/`emit_tool_span()` use everywhere in this SDK. **Wrap
-your `agent.on_messages(...)`/`team.run(...)` call in `async with
-governor.run("my-run"):`** to get one correlated run per chat in the
+the ambient `governor.run()` id when one is active, and otherwise gives
+each call a one-span run of its own, opened and closed around it -- the
+same fallback `emit_llm_span()`/`emit_tool_span()` use everywhere in this
+SDK. **Wrap your `agent.on_messages(...)`/`team.run(...)` call in `async
+with governor.run("my-run"):`** to get one correlated run per chat in the
 Gateway Observability Hub; without it, every LLM call and every tool call
-shows up as its own separate, uncorrelated entry.
+shows up as its own separate, uncorrelated (but completed, not stuck
+`running`) run.
 """
 
 from __future__ import annotations
@@ -158,9 +159,15 @@ def govern_tools(
     """
     check_mode(mode)
     for t in tools:
+        if getattr(t, "_matimo_governed", False):
+            continue  # govern_tools() twice must not stack two checks on one call
         name = getattr(t, "name", None) or type(t).__name__
         base_run = t.run
         t.run = _wrap_run(base_run, name, governor, mode, category)  # type: ignore[method-assign]
+        try:
+            t._matimo_governed = True  # noqa: SLF001
+        except Exception:  # noqa: BLE001 -- a stricter model config may reject this; harmless
+            pass
     return tools
 
 

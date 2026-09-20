@@ -47,18 +47,18 @@ cost of no token-usage enrichment for a streamed call).
 ADK's invocation_id, CrewAI exposes no natural per-`kickoff()` id this
 interceptor or `govern_tool()`'s tool wrapper can see. Every span here (LLM
 and tool alike) uses the ambient `governor.run()` id when one is active,
-and otherwise falls back to a fresh, uncorrelated id per call -- the same
-fallback `emit_llm_span()`/`emit_tool_span()` use everywhere in this SDK.
-**Wrap `crew.kickoff()` in `with governor.run("my-crew-run"):`** to get one
-correlated run per crew execution in the Gateway Observability Hub;
-without it, every LLM call and every tool call in the crew shows up as its
-own separate, uncorrelated entry.
+and otherwise gives each call a one-span run of its own, opened and closed
+around it -- the same fallback `emit_llm_span()`/`emit_tool_span()` use
+everywhere in this SDK. **Wrap `crew.kickoff()` in
+`with governor.run("my-crew-run"):`** to get one correlated run per crew
+execution in the Gateway Observability Hub; without it, every LLM call and
+every tool call in the crew shows up as its own separate, uncorrelated
+(but completed, not stuck `running`) run.
 """
 
 from __future__ import annotations
 
 import functools
-import inspect
 import json
 import time
 from contextvars import ContextVar
@@ -71,6 +71,7 @@ from ._shared import (
     async_raise_if_suspended,
     call_args_from,
     check_mode,
+    default_llm_headers,
     emit_llm_span,
     emit_tool_span,
     sync_check_and_wait,
@@ -210,9 +211,12 @@ def govern_tool(
     if base_run is not None:
         tool._run = _wrap_sync_run(base_run, name, governor, mode, category)  # noqa: SLF001
 
-    overrides_arun = "_arun" in type(tool).__dict__ or any(
-        "_arun" in base.__dict__ for base in type(tool).__mro__[1:-1]
-    )
+    # CrewAI's default `_arun` just raises NotImplementedError. Wrapping it would
+    # run a policy check (and possibly open a human-approval request) for a call
+    # that can never execute, so only a real override is wrapped.
+    from crewai.tools import BaseTool as CrewBaseTool
+
+    overrides_arun = getattr(type(tool), "_arun", None) is not CrewBaseTool._arun
     base_arun = getattr(tool, "_arun", None)
     if overrides_arun and base_arun is not None:
         tool._arun = _wrap_async_run(base_arun, name, governor, mode, category)  # noqa: SLF001
@@ -284,21 +288,16 @@ def gateway_llm(governor: Any, *, model: str | None = None, **kwargs: Any) -> An
     `requireSignedRequests=true`. The same interceptor also emits an LLM
     span per call -- see this module's docstring, "LLM spans and gen_ai.*
     attributes". `additional_params.extra_headers` stays as a static
-    fallback and is the only mechanism used with an `AsyncGovernor` (its
-    header computation is a coroutine, which CrewAI's sync interceptor
-    cannot await) -- **no interceptor is installed at all in that case, so
-    an `AsyncGovernor`-backed `gateway_llm()` gets neither live headers nor
-    LLM spans**, only the tool spans `govern_tool()`/`govern_crew()`
-    already record independently. Session expiry is not retried here; the
-    default session TTL is one hour.
+    fallback. Needs a sync `Governor` (an `AsyncGovernor` raises a clear
+    `TypeError`: its session handshake must be awaited, and this builder is
+    synchronous); a sync `Governor` still serves async CrewAI code. Session
+    expiry is not retried here; the default session TTL is one hour.
     """
-    headers = governor.openai_client_kwargs()["default_headers"]
+    headers = default_llm_headers(governor, "gateway_llm")
     model_name = model or "matimo/auto"
     from crewai import LLM
 
-    interceptor = None
-    if not inspect.iscoroutinefunction(getattr(governor, "request_headers", None)):
-        interceptor = make_interceptor(governor)
+    interceptor = make_interceptor(governor)
 
     return LLM(  # type: ignore[call-arg]
         # `custom_openai` is a real, working kwarg at runtime -- it is
