@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # Python dependencies (uv.lock). The adapters track fast-moving frameworks, so
+  # weekly grouped updates keep the "verified against" versions from going stale.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # The release workflow publishes to PyPI, so its actions get the same care.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci(deps)"
