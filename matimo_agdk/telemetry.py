@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from ._redact import redact
+from ._redact import redact, scrub_string
 from .exceptions import AgentSuspendedLocally, GatewayError
 from .transport import AsyncGatewayHTTP, GatewayHTTP
 
@@ -69,6 +69,10 @@ class GovernanceState:
     telemetry_staleness_minutes: float = 30.0
     server_time: str | None = None
     last_polled_monotonic: float = field(default_factory=time.monotonic)
+    # Unlike last_polled_monotonic (which starts at "now"), this is None until a
+    # heartbeat has really arrived, so "never heard from Gateway" is distinguishable
+    # from "heard just now". The tool-check fail-open rule reads it.
+    last_heartbeat_monotonic: float | None = None
 
     def update_from_heartbeat(self, heartbeat: dict[str, Any]) -> None:
         self.lifecycle_status = heartbeat.get("lifecycleStatus", self.lifecycle_status)
@@ -79,6 +83,7 @@ class GovernanceState:
         )
         self.server_time = heartbeat.get("serverTime", self.server_time)
         self.last_polled_monotonic = time.monotonic()
+        self.last_heartbeat_monotonic = self.last_polled_monotonic
 
     @property
     def is_suspended(self) -> bool:
@@ -201,6 +206,18 @@ def llm_span(
     )
 
 
+MAX_TOOL_RESULT_LEN = 500
+
+
+def result_text(result: Any) -> str:
+    """A tool result as span text: key-redacted if it is a dict or list, scrubbed
+    for secret-shaped strings, then cut to MAX_TOOL_RESULT_LEN characters.
+    Redaction runs on the whole value before the cut, so a secret straddling the
+    limit is masked rather than half-sent."""
+    text = str(redact(result))
+    return scrub_string(text)[:MAX_TOOL_RESULT_LEN]
+
+
 def tool_span(
     run_id: str,
     tool_name: str,
@@ -224,7 +241,7 @@ def tool_span(
     if arguments is not None:
         attrs.setdefault("gen_ai.tool.call.arguments", arguments)
     if result is not None:
-        attrs.setdefault("gen_ai.tool.call.result", str(result)[:500])
+        attrs.setdefault("gen_ai.tool.call.result", result_text(result))
     return build_event(
         run_id=run_id,
         kind="tool",

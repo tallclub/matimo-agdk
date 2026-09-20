@@ -23,8 +23,9 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import quote
 
+from ._outage import OutageGuard, is_transport_failure
 from ._redact import redact, scrub_string
-from .exceptions import GatewayError, ToolCheckTimeout
+from .exceptions import GatewayError, ToolCheckTimeout, ToolCheckUnavailable
 from .transport import AsyncGatewayHTTP, GatewayHTTP
 
 Decision = Literal["ALLOW", "DENY", "PENDING"]
@@ -78,6 +79,12 @@ class ToolDecision:
     reason: str | None = None
     resume_token: str | None = None
     request_id: str | None = None
+    # True for an ALLOW the SDK granted itself because Gateway could not answer
+    # and tool_check_failure_mode="fail_open_bounded" permitted it. Never set
+    # for a decision Gateway actually rendered. `degraded_age_seconds` is how
+    # long ago Gateway was last heard from.
+    degraded: bool = False
+    degraded_age_seconds: float | None = None
 
     @property
     def allowed(self) -> bool:
@@ -124,6 +131,10 @@ def _decision_from(data: dict[str, Any]) -> ToolDecision:
     )
 
 
+def _is_recognized(data: dict[str, Any]) -> bool:
+    return data.get("decision") in _VALID_DECISIONS
+
+
 def _report_body(
     resume_token: str, status: str, duration_ms: int | None, error: str | None
 ) -> dict[str, Any]:
@@ -158,6 +169,7 @@ class ToolGovernor:
         poll_max_interval: float = DEFAULT_POLL_MAX_INTERVAL_SECONDS,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
         recheck_delays: tuple[float, ...] = DEFAULT_RECHECK_DELAYS,
+        outage: OutageGuard | None = None,
     ) -> None:
         self._http = http
         self._identity_token = identity_token
@@ -168,6 +180,9 @@ class ToolGovernor:
         self.poll_max_interval = poll_max_interval
         self.max_wait_seconds = max_wait_seconds
         self.recheck_delays = recheck_delays
+        # Circuit breaker and fail-open policy for when Gateway cannot answer a
+        # check; the default is fail_closed with a 3-failure, 30s breaker.
+        self.outage = outage or OutageGuard()
 
     def rebind(
         self,
@@ -209,11 +224,14 @@ class ToolGovernor:
         yields one, becomes a DENY -- never a PENDING the caller might treat
         as "not denied" and run the tool on."""
         decision = self.check(tool_name, args, category_hint=category_hint)
+        if decision.degraded:
+            return decision
         for delay in self.recheck_delays:
             if not decision.pending_without_token:
                 break
             time.sleep(delay * random.uniform(0.9, 1.1))
-            decision = self.check(tool_name, args, category_hint=category_hint)
+            # A PENDING is never failed open: re-check without the outage fallback.
+            decision = self._check_raw(tool_name, args, category_hint=category_hint)
         if decision.pending_without_token:
             return ToolDecision(decision="DENY", reason=NO_RESUME_TOKEN_DENY_REASON)
         if decision.pending and decision.resume_token:
@@ -228,15 +246,52 @@ class ToolGovernor:
         category_hint: str | None = None,
         include_args: bool = True,
     ) -> ToolDecision:
-        resp = self._http.request(
-            "POST",
-            "/tools/check",
-            json_body=_check_body(tool_name, args, category_hint, include_args),
-            headers=self._headers(),
-            idempotent=True,
-            **self._sign_kwargs(),
-        )
-        return _decision_from(resp.data or {})
+        """One /tools/check call. If Gateway cannot answer at all (a connection
+        error, timeout or 5xx, or the circuit breaker is open), the configured
+        `tool_check_failure_mode` decides: raise ToolCheckUnavailable
+        (`fail_closed`, the default), or return a degraded ALLOW
+        (`fail_open_bounded`, only when every condition in matimo_agdk._outage
+        holds). A DENY, an unrecognized decision and any 4xx are never softened."""
+        try:
+            return self._check_raw(
+                tool_name, args, category_hint=category_hint, include_args=include_args
+            )
+        except ToolCheckUnavailable as exc:
+            return self.outage.degrade(tool_name, exc)
+
+    def _check_raw(
+        self,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        category_hint: str | None = None,
+        include_args: bool = True,
+    ) -> ToolDecision:
+        """check() without the fail-open fallback: breaker-gated, and a
+        transport-level failure raises ToolCheckUnavailable."""
+        self.outage.before_call()
+        try:
+            resp = self._http.request(
+                "POST",
+                "/tools/check",
+                json_body=_check_body(tool_name, args, category_hint, include_args),
+                headers=self._headers(),
+                idempotent=True,
+                **self._sign_kwargs(),
+            )
+        except GatewayError as exc:
+            if is_transport_failure(exc):
+                raise self.outage.transport_failed(exc) from exc
+            self.outage.reachable()
+            raise
+        except BaseException:
+            self.outage.aborted()
+            raise
+        self.outage.reachable()
+        data = resp.data or {}
+        decision = _decision_from(data)
+        self.outage.record_decision(tool_name, decision.decision, recognized=_is_recognized(data))
+        return decision
 
     def status(self, resume_token: str) -> ToolDecision:
         resp = self._http.request(
@@ -247,6 +302,7 @@ class ToolGovernor:
             idempotent=True,
             **self._sign_kwargs(),
         )
+        self.outage.record_contact()
         return _decision_from(resp.data or {})
 
     def await_decision(
@@ -319,6 +375,7 @@ class AsyncToolGovernor:
         poll_max_interval: float = DEFAULT_POLL_MAX_INTERVAL_SECONDS,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
         recheck_delays: tuple[float, ...] = DEFAULT_RECHECK_DELAYS,
+        outage: OutageGuard | None = None,
     ) -> None:
         self._http = http
         self._identity_token = identity_token
@@ -329,6 +386,9 @@ class AsyncToolGovernor:
         self.poll_max_interval = poll_max_interval
         self.max_wait_seconds = max_wait_seconds
         self.recheck_delays = recheck_delays
+        # Circuit breaker and fail-open policy for when Gateway cannot answer a
+        # check; the default is fail_closed with a 3-failure, 30s breaker.
+        self.outage = outage or OutageGuard()
 
     def rebind(
         self,
@@ -365,11 +425,14 @@ class AsyncToolGovernor:
     ) -> ToolDecision:
         """Async twin of ToolGovernor.check_and_wait()."""
         decision = await self.check(tool_name, args, category_hint=category_hint)
+        if decision.degraded:
+            return decision
         for delay in self.recheck_delays:
             if not decision.pending_without_token:
                 break
             await asyncio.sleep(delay * random.uniform(0.9, 1.1))
-            decision = await self.check(tool_name, args, category_hint=category_hint)
+            # A PENDING is never failed open: re-check without the outage fallback.
+            decision = await self._check_raw(tool_name, args, category_hint=category_hint)
         if decision.pending_without_token:
             return ToolDecision(decision="DENY", reason=NO_RESUME_TOKEN_DENY_REASON)
         if decision.pending and decision.resume_token:
@@ -384,15 +447,51 @@ class AsyncToolGovernor:
         category_hint: str | None = None,
         include_args: bool = True,
     ) -> ToolDecision:
-        resp = await self._http.request(
-            "POST",
-            "/tools/check",
-            json_body=_check_body(tool_name, args, category_hint, include_args),
-            headers=self._headers(),
-            idempotent=True,
-            **self._sign_kwargs(),
-        )
-        return _decision_from(resp.data or {})
+        """One /tools/check call. If Gateway cannot answer at all (a connection
+        error, timeout or 5xx, or the circuit breaker is open), the configured
+        `tool_check_failure_mode` decides: raise ToolCheckUnavailable
+        (`fail_closed`, the default), or return a degraded ALLOW
+        (`fail_open_bounded`, only when every condition in matimo_agdk._outage
+        holds). A DENY, an unrecognized decision and any 4xx are never softened."""
+        try:
+            return await self._check_raw(
+                tool_name, args, category_hint=category_hint, include_args=include_args
+            )
+        except ToolCheckUnavailable as exc:
+            return self.outage.degrade(tool_name, exc)
+
+    async def _check_raw(
+        self,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        category_hint: str | None = None,
+        include_args: bool = True,
+    ) -> ToolDecision:
+        """See ToolGovernor._check_raw()."""
+        self.outage.before_call()
+        try:
+            resp = await self._http.request(
+                "POST",
+                "/tools/check",
+                json_body=_check_body(tool_name, args, category_hint, include_args),
+                headers=self._headers(),
+                idempotent=True,
+                **self._sign_kwargs(),
+            )
+        except GatewayError as exc:
+            if is_transport_failure(exc):
+                raise self.outage.transport_failed(exc) from exc
+            self.outage.reachable()
+            raise
+        except BaseException:
+            self.outage.aborted()
+            raise
+        self.outage.reachable()
+        data = resp.data or {}
+        decision = _decision_from(data)
+        self.outage.record_decision(tool_name, decision.decision, recognized=_is_recognized(data))
+        return decision
 
     async def status(self, resume_token: str) -> ToolDecision:
         resp = await self._http.request(
@@ -403,6 +502,7 @@ class AsyncToolGovernor:
             idempotent=True,
             **self._sign_kwargs(),
         )
+        self.outage.record_contact()
         return _decision_from(resp.data or {})
 
     async def await_decision(

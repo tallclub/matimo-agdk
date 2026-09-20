@@ -98,6 +98,30 @@ class GatewayUnavailable(GatewayError):
     budget talking to Gateway at all."""
 
 
+class ToolCheckUnavailable(GatewayUnavailable):
+    """A tool check could not be answered because Gateway is unreachable or
+    failing (a connection error, a timeout, a 5xx), and the configured
+    `tool_check_failure_mode` did not allow the call to proceed.
+
+    `circuit_open` is True when the SDK did not even try: its circuit breaker
+    is open after repeated transport failures, so it failed fast instead of
+    waiting out the transport's retries again. Adapters surface this as a
+    normal recoverable tool error, the same way they surface `ToolDenied`.
+    It subclasses `GatewayUnavailable`, so existing `except` clauses still
+    catch it."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        code: str | None = "tool_check_unavailable",
+        circuit_open: bool = False,
+    ) -> None:
+        super().__init__(message, status_code=status_code, code=code)
+        self.circuit_open = circuit_open
+
+
 class ToolDenied(GatewayError):
     """Raised by Governor.guard() when a tool check resolves to DENY (either
     immediately, or after a PENDING resolves to DENY)."""
