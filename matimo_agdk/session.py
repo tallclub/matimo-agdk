@@ -19,10 +19,10 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, TypeVar
 
-from .exceptions import SessionExpired
+from .exceptions import GatewayError, SessionExpired
 from .identity import IdentityCredentials, JWSSigner
 from .transport import AsyncGatewayHTTP, GatewayHTTP
 
@@ -38,9 +38,7 @@ R = TypeVar("R")
 
 
 def _parse_expires_at(value: str) -> datetime:
-    # Python's fromisoformat() does not accept a trailing 'Z' before 3.11;
-    # normalize defensively regardless of the running interpreter.
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return datetime.fromisoformat(value)
 
 
 @dataclass
@@ -51,11 +49,19 @@ class _SessionState:
     ttl_seconds: float
 
 
-def _build_session_state(data: dict[str, Any]) -> _SessionState:
-    expires_at = _parse_expires_at(data["expiresAt"])
-    ttl = max((expires_at - datetime.now(timezone.utc)).total_seconds(), 1.0)
+def _build_session_state(data: Any) -> _SessionState:
+    # Server drift must surface as a GatewayError (which every caller already
+    # handles), never as a bare KeyError that kills a background thread.
+    try:
+        token = data["sessionToken"]
+        expires_at = _parse_expires_at(data["expiresAt"])
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GatewayError(f"malformed session handshake response: {exc!r}") from exc
+    ttl = max((expires_at - datetime.now(UTC)).total_seconds(), 1.0)
     return _SessionState(
-        token=data["sessionToken"],
+        token=token,
         expires_at=expires_at,
         issued_monotonic=time.monotonic(),
         ttl_seconds=ttl,
@@ -112,6 +118,12 @@ class SessionManager:
         reactively after a live SessionExpired response, and after a key
         rotation."""
         with self._lock:
+            self._state = None
+
+    def rebind(self, identity: IdentityCredentials) -> None:
+        """Adopts a rotated identity in place and drops the cached session."""
+        with self._lock:
+            self._identity = identity
             self._state = None
 
     def call_with_retry(self, fn: Callable[[str], R]) -> R:
@@ -171,6 +183,11 @@ class AsyncSessionManager:
     async def invalidate(self) -> None:
         async with self._get_lock():
             self._state = None
+
+    def rebind(self, identity: IdentityCredentials) -> None:
+        """Adopts a rotated identity in place and drops the cached session."""
+        self._identity = identity
+        self._state = None
 
     async def call_with_retry(self, fn: Callable[[str], Awaitable[R]]) -> R:
         token = await self.get_token()
