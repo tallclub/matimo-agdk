@@ -29,6 +29,11 @@ same graceful-recovery shape LangChain's `handle_tool_error` provides),
 rather than crashing the whole crew run. `mode="observe"` only records tool
 spans, never calls `check_tool()`.
 
+A Gateway outage that leaves a tool check unanswered (fail-closed) raises
+`ToolCheckUnavailable` from the same place, and is surfaced to the agent the same
+way. With `tool_check_failure_mode="fail_open_bounded"` the tool may run instead,
+and its span is marked `matimo.degraded_mode`.
+
 Rapid suspend (`mode="govern"` only): `governor.raise_if_suspended()` is
 called before each wrapped tool's real body runs.
 
@@ -64,6 +69,7 @@ import time
 from contextvars import ContextVar
 from typing import Any
 
+from .._outage import degraded_attributes
 from ..exceptions import ToolDenied
 from ._shared import (
     Mode,
@@ -143,17 +149,24 @@ def _wrap_sync_run(
     @functools.wraps(inner)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         call_args = call_args_from(args, kwargs)
+        decision = None
         if mode == "govern":
             sync_raise_if_suspended(governor)
+            # A ToolCheckUnavailable (Gateway unreachable, fail-closed) propagates like
+            # ToolDenied: CrewAI's ToolUsage turns either into an observation.
             decision = sync_check_and_wait(governor, tool_name, call_args, category=category)
             if decision.denied:
                 raise ToolDenied(decision.reason)
         started = _now()
         status = "completed"
+        span_result: Any = None
         try:
-            return inner(*args, **kwargs)
-        except Exception:
+            result = inner(*args, **kwargs)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             emit_tool_span(
@@ -162,6 +175,8 @@ def _wrap_sync_run(
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
                 arguments=call_args,
+                result=span_result,
+                attributes=degraded_attributes(decision),
             )
 
     return wrapper
@@ -173,6 +188,7 @@ def _wrap_async_run(
     @functools.wraps(inner)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         call_args = call_args_from(args, kwargs)
+        decision = None
         if mode == "govern":
             await async_raise_if_suspended(governor)
             decision = await async_check_and_wait(governor, tool_name, call_args, category=category)
@@ -180,10 +196,14 @@ def _wrap_async_run(
                 raise ToolDenied(decision.reason)
         started = _now()
         status = "completed"
+        span_result: Any = None
         try:
-            return await inner(*args, **kwargs)
-        except Exception:
+            result = await inner(*args, **kwargs)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             emit_tool_span(
@@ -192,6 +212,8 @@ def _wrap_async_run(
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
                 arguments=call_args,
+                result=span_result,
+                attributes=degraded_attributes(decision),
             )
 
     return wrapper

@@ -98,6 +98,43 @@ when available. Spans correlate via the framework's own `run_id`/
 agent's chain-start, its LLM calls, and its tool calls all land under one
 `run_id` in Matimo's telemetry.
 
+## One span per tool call
+
+A tool wrapped by `govern_tools()` and also seen by a callback handler would
+otherwise be reported twice. The governing wrapper is canonical, because it is
+the only one that sees the decision: it emits the single tool span, with the
+call's arguments, status (`completed`/`error`/`denied`), the result when
+`capture_tool_results` is on, a `matimo.degraded_mode` marker when Gateway was
+unreachable and the call ran fail-open, and LangChain's own `run_id`/
+`parent_run_id` as `span_id`/`parent_span_id`, so it sits in the same run as
+the chain's LLM spans. The handler notices that the wrapper already reported the
+call and skips its own span. A tool that is *not* wrapped still gets the
+handler's span.
+
+The wrapper finds its own LangChain run through `langchain_core`'s
+`var_child_runnable_config`, the contextvar `BaseTool.run()`/`arun()` set around
+`_run`/`_arun` for nested runnables. If the wrapper cannot find it (the tool's
+`_run` called directly, outside `BaseTool.run()`), it still emits its span, just
+without those ids.
+
+A denied call's span (`denied`) is emitted by the wrapper as well and carries the
+same ids, so with a handler attached it is tied to the run tree; without a handler
+there is no run tree to tie it to. LangChain reports a `ToolException` that
+`handle_tool_error` absorbed as an ordinary `on_tool_end`; the handler does not try
+to reclassify that, which is one more reason the wrapper's span is the canonical one.
+
+A Gateway outage that leaves a tool check unanswered (fail-closed) is raised as a
+`ToolException` too, so a tool with `handle_tool_error=True` hands the agent a
+recoverable observation instead of crashing the chain.
+
+## LLM provider
+
+An LLM span's `gen_ai.provider.name` is derived from the serialized class name
+LangChain passes to `on_llm_start` (`ChatOpenAI` gives `openai`, `ChatAnthropic`
+gives `anthropic`, `ChatGoogleGenerativeAI` gives `google`); an unknown class
+gives no provider. It names the client class, which is not always the upstream
+provider when the call is routed through Gateway.
+
 ## Run lifecycle
 
 Gateway only ends a run on an explicit terminal `kind:"run"` span
@@ -117,9 +154,12 @@ from __future__ import annotations
 import functools
 import time
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from .._outage import degraded_attributes
+from ..exceptions import ToolCheckUnavailable
 from ..governor import current_run_id
 from ._shared import (
     Mode,
@@ -132,7 +172,6 @@ from ._shared import (
     emit_tool_span,
     sync_check_and_wait,
     sync_raise_if_suspended,
-    truncate,
 )
 
 try:
@@ -155,6 +194,79 @@ def _now() -> float:
 # inner wrapper sees its own id here and skips, so one call is checked once and
 # a PENDING approval is requested once, not twice.
 _GOVERNED_TOOL: ContextVar[int | None] = ContextVar("matimo_agdk_langchain_governed", default=None)
+
+
+@dataclass
+class _ToolCall:
+    """A tool call a callback handler has started and not yet finished. `emitted`
+    flips to True when a governing wrapper has reported the call, so the handler
+    does not report it a second time."""
+
+    root: str
+    parent_run_id: UUID | None
+    emitted: bool = False
+
+
+# LangChain tool run id -> its in-flight call. Keyed by that id (unique per call, and
+# the same id the wrapper reads back from `BaseTool.run()`'s config context) rather
+# than by tool name, so two concurrent calls of one tool cannot be confused.
+_TOOL_CALLS: dict[UUID, _ToolCall] = {}
+
+
+def _current_tool_call() -> tuple[UUID, _ToolCall] | None:
+    """The in-flight call the running code is inside, if a Matimo handler
+    registered it. `BaseTool.run()`/`arun()` set `var_child_runnable_config` around
+    `_run`/`_arun` with a child callback manager whose `parent_run_id` is the tool's
+    own run id."""
+    try:
+        from langchain_core.runnables.config import var_child_runnable_config
+
+        config = var_child_runnable_config.get()
+        run_id = getattr(config.get("callbacks") if config else None, "parent_run_id", None)
+    except Exception:  # noqa: BLE001 -- a langchain change must not break tool calls
+        return None
+    if run_id is None:
+        return None
+    call = _TOOL_CALLS.get(run_id)
+    return (run_id, call) if call is not None else None
+
+
+def _span_ids(current: tuple[UUID, _ToolCall] | None) -> dict[str, Any]:
+    """The framework-side identity of a tool call, as `emit_tool_span()` kwargs
+    (`run_id` is popped by the caller, the rest passed through)."""
+    if current is None:
+        return {}
+    run_id, call = current
+    ids: dict[str, Any] = {"run_id": call.root, "span_id": str(run_id), "call_id": str(run_id)}
+    if call.parent_run_id is not None:
+        ids["parent_span_id"] = str(call.parent_run_id)
+    return ids
+
+
+def _mark_emitted(current: tuple[UUID, _ToolCall] | None) -> None:
+    if current is not None:
+        current[1].emitted = True
+
+
+# Class name in the serialized id LangChain passes to `on_llm_start` -> the
+# `gen_ai.provider.name` of its span. Anything not listed gets no provider.
+_PROVIDER_BY_CLASS = {
+    "ChatOpenAI": "openai",
+    "OpenAI": "openai",
+    "ChatAnthropic": "anthropic",
+    "AnthropicLLM": "anthropic",
+    "ChatGoogleGenerativeAI": "google",
+    "GoogleGenerativeAI": "google",
+    "ChatVertexAI": "google",
+    "VertexAI": "google",
+}
+
+
+def _provider_from_serialized(serialized: dict[str, Any] | None) -> str | None:
+    ident = (serialized or {}).get("id")
+    if isinstance(ident, list) and ident:
+        return _PROVIDER_BY_CLASS.get(str(ident[-1]))
+    return None
 
 
 def _node_name(serialized: dict[str, Any] | None, kwargs: dict[str, Any]) -> str | None:
@@ -204,6 +316,9 @@ class _RunTree:
         self._started_at[run_id] = _now()
         return root, owned
 
+    def root_of(self, run_id: UUID) -> str:
+        return self._root_of.get(run_id, str(run_id))
+
     def finish(self, run_id: UUID) -> tuple[str, int]:
         root = self._root_of.pop(run_id, str(run_id))
         started = self._started_at.pop(run_id, _now())
@@ -222,6 +337,7 @@ class _LangChainSpans:
         # Runs this handler opened itself (no parent, no ambient governor.run()),
         # keyed by the root node's LangChain run_id -> (name, started).
         self._owned: dict[UUID, tuple[str, float]] = {}
+        self._provider: dict[UUID, str | None] = {}
 
     def _start(self, run_id: UUID, parent_run_id: UUID | None, name: str | None) -> None:
         root, owned = self.tree.start(run_id, parent_run_id, ambient=current_run_id())
@@ -262,8 +378,13 @@ class _LangChainSpans:
         self._close(run_id, status)
 
     def on_llm_start(
-        self, run_id: UUID, parent_run_id: UUID | None, name: str | None = None
+        self,
+        run_id: UUID,
+        parent_run_id: UUID | None,
+        name: str | None = None,
+        provider: str | None = None,
     ) -> None:
+        self._provider[run_id] = provider
         self._start(run_id, parent_run_id, name)
 
     def on_llm_end(
@@ -284,6 +405,7 @@ class _LangChainSpans:
             span_id=str(run_id),
             parent_span_id=str(parent_run_id) if parent_run_id else None,
             model=model,
+            provider=self._provider.pop(run_id, None),
             finish_reasons=finish_reasons,
             status=status,
             duration_ms=duration_ms,
@@ -295,6 +417,7 @@ class _LangChainSpans:
         self, run_id: UUID, parent_run_id: UUID | None, name: str | None = None
     ) -> None:
         self._start(run_id, parent_run_id, name)
+        _TOOL_CALLS[run_id] = _ToolCall(self.tree.root_of(run_id), parent_run_id)
 
     def on_tool_end(
         self,
@@ -306,17 +429,21 @@ class _LangChainSpans:
         result: Any = None,
     ) -> None:
         root, duration_ms = self.tree.finish(run_id)
-        emit_tool_span(
-            self.governor,
-            tool_name,
-            run_id=root,
-            span_id=str(run_id),
-            parent_span_id=str(parent_run_id) if parent_run_id else None,
-            status=status,
-            duration_ms=duration_ms,
-            call_id=str(run_id),
-            result=truncate(result) if result is not None else None,
-        )
+        call = _TOOL_CALLS.pop(run_id, None)
+        # A governing wrapper that already reported this call is canonical (it saw
+        # the decision); reporting it again would show one call as two spans.
+        if call is None or not call.emitted:
+            emit_tool_span(
+                self.governor,
+                tool_name,
+                run_id=root,
+                span_id=str(run_id),
+                parent_span_id=str(parent_run_id) if parent_run_id else None,
+                status=status,
+                duration_ms=duration_ms,
+                call_id=str(run_id),
+                result=result,
+            )
         self._close(run_id, status)
 
 
@@ -393,7 +520,12 @@ class MatimoCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
     ) -> None:
         if self.mode == "govern":
             sync_raise_if_suspended(self.governor)
-        self._impl.on_llm_start(run_id, parent_run_id, _node_name(serialized, kwargs))
+        self._impl.on_llm_start(
+            run_id,
+            parent_run_id,
+            _node_name(serialized, kwargs),
+            _provider_from_serialized(serialized),
+        )
 
     def on_chat_model_start(
         self,
@@ -406,7 +538,12 @@ class MatimoCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
     ) -> None:
         if self.mode == "govern":
             sync_raise_if_suspended(self.governor)
-        self._impl.on_llm_start(run_id, parent_run_id, _node_name(serialized, kwargs))
+        self._impl.on_llm_start(
+            run_id,
+            parent_run_id,
+            _node_name(serialized, kwargs),
+            _provider_from_serialized(serialized),
+        )
 
     def on_llm_end(
         self, response: Any, *, run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any
@@ -523,7 +660,12 @@ class AsyncMatimoCallbackHandler(AsyncCallbackHandler):  # type: ignore[misc]
     ) -> None:
         if self.mode == "govern":
             await async_raise_if_suspended(self.governor)
-        self._impl.on_llm_start(run_id, parent_run_id, _node_name(serialized, kwargs))
+        self._impl.on_llm_start(
+            run_id,
+            parent_run_id,
+            _node_name(serialized, kwargs),
+            _provider_from_serialized(serialized),
+        )
 
     async def on_chat_model_start(
         self,
@@ -536,7 +678,12 @@ class AsyncMatimoCallbackHandler(AsyncCallbackHandler):  # type: ignore[misc]
     ) -> None:
         if self.mode == "govern":
             await async_raise_if_suspended(self.governor)
-        self._impl.on_llm_start(run_id, parent_run_id, _node_name(serialized, kwargs))
+        self._impl.on_llm_start(
+            run_id,
+            parent_run_id,
+            _node_name(serialized, kwargs),
+            _provider_from_serialized(serialized),
+        )
 
     async def on_llm_end(
         self, response: Any, *, run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any
@@ -607,9 +754,26 @@ def _wrap_sync_run(
         if _GOVERNED_TOOL.get() == tool_id:
             return inner(*args, **kwargs)  # already governed by the async wrapper above us
         call_args = call_args_from(args, kwargs, exclude=("run_manager", "config"))
+        current = _current_tool_call()
+        ids = _span_ids(current)
+        span_run_id = ids.pop("run_id", None)
+        decision = None
         if mode == "govern":
             sync_raise_if_suspended(governor)
-            decision = sync_check_and_wait(governor, tool_name, call_args, category=category)
+            try:
+                decision = sync_check_and_wait(
+                    governor,
+                    tool_name,
+                    call_args,
+                    category=category,
+                    run_id=span_run_id,
+                    span_extra=ids,
+                )
+            except ToolCheckUnavailable as exc:
+                # Gateway could not answer and the failure mode is fail-closed. Like a
+                # DENY, this must be a ToolException for LangChain's
+                # `handle_tool_error` to turn it into a recoverable observation.
+                raise ToolException(str(exc)) from exc
             if decision.denied:
                 # Raise langchain_core's own ToolException, not the
                 # framework-agnostic ToolDenied. Found live-testing against
@@ -624,22 +788,32 @@ def _wrap_sync_run(
                 # crash the whole chain exactly like an unhandled callback
                 # exception would -- the opposite of this function's whole
                 # purpose. See CHANGELOG.md, 2026-09-18 live verification.
+                _mark_emitted(current)
                 raise ToolException(decision.reason)
         started = _now()
         status = "completed"
+        span_result: Any = None
         try:
-            return inner(*args, **kwargs)
-        except Exception:
+            result = inner(*args, **kwargs)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             emit_tool_span(
                 governor,
                 tool_name,
+                run_id=span_run_id,
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
                 arguments=call_args,
+                result=span_result,
+                attributes=degraded_attributes(decision),
+                **ids,
             )
+            _mark_emitted(current)
 
     return wrapper
 
@@ -652,31 +826,56 @@ def _wrap_async_run(
         if _GOVERNED_TOOL.get() == tool_id:
             return await inner(*args, **kwargs)
         call_args = call_args_from(args, kwargs, exclude=("run_manager", "config"))
+        current = _current_tool_call()
+        ids = _span_ids(current)
+        span_run_id = ids.pop("run_id", None)
+        decision = None
         if mode == "govern":
             await async_raise_if_suspended(governor)
-            decision = await async_check_and_wait(governor, tool_name, call_args, category=category)
+            try:
+                decision = await async_check_and_wait(
+                    governor,
+                    tool_name,
+                    call_args,
+                    category=category,
+                    run_id=span_run_id,
+                    span_extra=ids,
+                )
+            except ToolCheckUnavailable as exc:
+                # See _wrap_sync_run: a recoverable ToolException, like a DENY.
+                raise ToolException(str(exc)) from exc
             if decision.denied:
                 # See _wrap_sync_run's identical comment: ToolException, not
                 # ToolDenied, is what BaseTool.run()/arun()'s error-handling
                 # actually special-cases.
+                _mark_emitted(current)
                 raise ToolException(decision.reason)
         started = _now()
         status = "completed"
+        span_result: Any = None
         marker = _GOVERNED_TOOL.set(tool_id)
         try:
-            return await inner(*args, **kwargs)
-        except Exception:
+            result = await inner(*args, **kwargs)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             _GOVERNED_TOOL.reset(marker)
             emit_tool_span(
                 governor,
                 tool_name,
+                run_id=span_run_id,
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
                 arguments=call_args,
+                result=span_result,
+                attributes=degraded_attributes(decision),
+                **ids,
             )
+            _mark_emitted(current)
 
     return wrapper
 

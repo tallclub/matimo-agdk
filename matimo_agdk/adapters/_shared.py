@@ -94,9 +94,15 @@ def sync_check_and_wait(
     *,
     category: str | None = None,
     run_id: str | None = None,
+    span_extra: dict[str, Any] | None = None,
 ) -> ToolDecision:
     """Blocking check-then-await-PENDING, for a sync Governor called from
-    sync framework code. Raises TypeError if handed an AsyncGovernor."""
+    sync framework code. Raises TypeError if handed an AsyncGovernor.
+
+    A DENY records a `denied` tool span here, under `run_id`, carrying any
+    `span_extra` (`span_id`, `parent_span_id`, `call_id`) the framework gave the
+    call. Gateway being unreachable raises ToolCheckUnavailable (fail-closed) or
+    returns a degraded ALLOW; see matimo_agdk._outage."""
     if is_async_governor(governor):
         raise TypeError(
             "an AsyncGovernor was passed to a synchronous governed call site -- "
@@ -105,7 +111,13 @@ def sync_check_and_wait(
     decision = governor.check_and_wait(tool_name, args, category_hint=category)
     if decision.denied:
         emit_tool_span(
-            governor, tool_name, run_id=run_id, status="denied", duration_ms=0, arguments=args
+            governor,
+            tool_name,
+            run_id=run_id,
+            status="denied",
+            duration_ms=0,
+            arguments=args,
+            **(span_extra or {}),
         )
     return decision
 
@@ -117,6 +129,7 @@ async def async_check_and_wait(
     *,
     category: str | None = None,
     run_id: str | None = None,
+    span_extra: dict[str, Any] | None = None,
 ) -> ToolDecision:
     """Non-blocking check-then-await-PENDING for async framework code.
     Awaits directly if `governor` is an AsyncGovernor; otherwise bridges
@@ -130,7 +143,13 @@ async def async_check_and_wait(
         )
     if decision.denied:
         emit_tool_span(
-            governor, tool_name, run_id=run_id, status="denied", duration_ms=0, arguments=args
+            governor,
+            tool_name,
+            run_id=run_id,
+            status="denied",
+            duration_ms=0,
+            arguments=args,
+            **(span_extra or {}),
         )
     return decision
 

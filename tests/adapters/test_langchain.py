@@ -10,6 +10,7 @@ import respx
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import ToolException, tool
 
+from matimo_agdk.config import GatewayConfig
 from matimo_agdk.exceptions import AgentSuspendedLocally
 from matimo_agdk.identity import IdentityCredentials
 from matimo_agdk.tools import ToolDecision
@@ -318,6 +319,8 @@ def test_llm_and_tool_spans_reach_the_exporter_through_real_builders() -> None:
     from matimo_agdk.governor import Governor
 
     gov = Governor.__new__(Governor)
+
+    gov.config = GatewayConfig()
     gov._telemetry = MagicMock()
     handler = MatimoCallbackHandler(gov, mode="observe")
 
@@ -348,6 +351,8 @@ def _real_governor_with_mock_exporter() -> Any:
     from matimo_agdk.governor import Governor
 
     gov = Governor.__new__(Governor)
+
+    gov.config = GatewayConfig()
     gov._telemetry = MagicMock()
     return gov
 

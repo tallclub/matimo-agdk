@@ -40,6 +40,12 @@ crashed run. `mode="govern"` (default) does exactly this: calls
 denies via the short-circuit dict rather than raising. `mode="observe"`
 never calls `check_tool()` at all, only records spans.
 
+A Gateway outage that leaves a tool check unanswered (fail-closed,
+`ToolCheckUnavailable`) is returned the same way, as `{"error": <message>}`, so the
+tool does not run and the run does not crash. With
+`tool_check_failure_mode="fail_open_bounded"` the tool may run instead, and its span
+is marked `matimo.degraded_mode` (see the core README).
+
 Rapid suspend (`mode="govern"` only): `governor.raise_if_suspended()` is
 called at the top of both `before_model_callback` and
 `before_tool_callback` -- since neither ADK contract catches an arbitrary
@@ -85,6 +91,8 @@ import time
 import uuid
 from typing import Any
 
+from .._outage import degraded_attributes
+from ..exceptions import ToolCheckUnavailable
 from ._shared import (
     Mode,
     async_check_and_wait,
@@ -93,7 +101,6 @@ from ._shared import (
     default_llm_headers,
     emit_llm_span,
     emit_tool_span,
-    truncate,
 )
 
 try:
@@ -139,7 +146,7 @@ class MatimoPlugin(BasePlugin):  # type: ignore[misc]
         self.category = category
         self._pending_llm: dict[str, tuple[str, float, str | None]] = {}
         self._previous_run: dict[str, str | None] = {}
-        self._pending_tool: dict[str, tuple[float, str | None]] = {}
+        self._pending_tool: dict[str, tuple[float, str | None, dict[str, Any] | None]] = {}
         self._open_runs: dict[str, tuple[str, float]] = {}
 
     def _restore_run(self, invocation_id: str) -> None:
@@ -250,34 +257,39 @@ class MatimoPlugin(BasePlugin):  # type: ignore[misc]
     ) -> dict[str, Any] | None:
         call_id = getattr(tool_context, "function_call_id", None) or uuid.uuid4().hex
         if self.mode == "observe":
-            self._pending_tool[call_id] = (_now(), None)
+            self._pending_tool[call_id] = (_now(), None, None)
             return None
 
         await async_raise_if_suspended(self.governor)
         # The denied span must land in ADK's own run (the invocation), not a
         # run of its own: bind_run_id() only covers model calls.
         invocation_id = getattr(tool_context, "invocation_id", None)
-        decision = await async_check_and_wait(
-            self.governor,
-            tool.name,
-            dict(tool_args),
-            category=self.category,
-            run_id=invocation_id or None,
-        )
+        try:
+            decision = await async_check_and_wait(
+                self.governor,
+                tool.name,
+                dict(tool_args),
+                category=self.category,
+                run_id=invocation_id or None,
+            )
+        except ToolCheckUnavailable as exc:
+            # Gateway could not answer and the failure mode is fail-closed: the tool
+            # does not run. Same graceful short-circuit as a DENY, not a crashed run.
+            return {"error": str(exc)}
         if decision.denied:
             # ADK's documented contract: a non-None dict from
             # before_tool_callback short-circuits dispatch and becomes the
             # tool's own result -- a graceful, recoverable DENY, not a
             # crashed run.
             return {"error": decision.reason or "tool call denied"}
-        self._pending_tool[call_id] = (_now(), decision.resume_token)
+        self._pending_tool[call_id] = (_now(), decision.resume_token, degraded_attributes(decision))
         return None
 
     async def after_tool_callback(
         self, *, tool: Any, tool_args: dict[str, Any], tool_context: Any, result: dict[str, Any]
     ) -> dict[str, Any] | None:
         call_id = getattr(tool_context, "function_call_id", None) or uuid.uuid4().hex
-        started, resume_token = self._pending_tool.pop(call_id, (_now(), None))
+        started, resume_token, degraded = self._pending_tool.pop(call_id, (_now(), None, None))
         invocation_id = getattr(tool_context, "invocation_id", None) or "unknown-invocation"
         emit_tool_span(
             self.governor,
@@ -288,7 +300,8 @@ class MatimoPlugin(BasePlugin):  # type: ignore[misc]
             status="completed",
             duration_ms=int((_now() - started) * 1000),
             arguments=dict(tool_args),
-            result=truncate(result),
+            result=result,
+            attributes=degraded,
         )
         if resume_token:
             await self._report_result_best_effort(resume_token, status="completed")
@@ -298,7 +311,7 @@ class MatimoPlugin(BasePlugin):  # type: ignore[misc]
         self, *, tool: Any, tool_args: dict[str, Any], tool_context: Any, error: Exception
     ) -> dict[str, Any] | None:
         call_id = getattr(tool_context, "function_call_id", None) or uuid.uuid4().hex
-        started, resume_token = self._pending_tool.pop(call_id, (_now(), None))
+        started, resume_token, degraded = self._pending_tool.pop(call_id, (_now(), None, None))
         invocation_id = getattr(tool_context, "invocation_id", None) or "unknown-invocation"
         emit_tool_span(
             self.governor,
@@ -309,7 +322,8 @@ class MatimoPlugin(BasePlugin):  # type: ignore[misc]
             status="error",
             duration_ms=int((_now() - started) * 1000),
             arguments=dict(tool_args),
-            result=truncate(str(error)),
+            result=str(error),
+            attributes=degraded,
         )
         if resume_token:
             await self._report_result_best_effort(resume_token, status="error", error=str(error))
