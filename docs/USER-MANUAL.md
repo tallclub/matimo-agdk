@@ -326,6 +326,7 @@ Details and caveats for each framework are in Part 12.
 | `SessionExpired` | The automatic renewal also failed. | Check the API key and the identity's status. |
 | `SignatureRejected` | Gateway could not verify the signature. | Rotate the key if the `.pem` file was overwritten. Also check your computer's clock. |
 | `RateLimited` | Too many requests. | Back off. The exception has `retry_after` when the server sends it. |
+| `ToolCheckUnavailable` (a `GatewayUnavailable`) | A tool check could not be answered: Gateway is unreachable or failing, or the SDK's circuit breaker is open (`circuit_open=True`) after repeated failures. The tool did not run. | Retry later. To let tools run through a short outage, see "When Gateway is down" in section 10. Adapters return it to the agent as a recoverable tool error. |
 | `GatewayUnavailable` | Network problem or a server 5xx. | Retry with backoff. LLM calls fail closed, and reporting fails open. |
 | HTTP 400 `no_default_connection` | LLM call without `model=` and the tenant has no default model. | Always pass `model=`. |
 | HTTP 403 `model_not_allowed` | The model is not set up for the tenant or not allowed for this agent. | Use a model your admin configured. |
@@ -393,10 +394,12 @@ Precedence, highest first: keyword arguments to `Governor(...)` or `Governor.fro
 | `MATIMO_FRAMEWORK` | `langchain`, `google-adk`, `crewai`, `autogen`, `custom` | `custom` |
 | `MATIMO_IDENTITY_TOKEN`, `MATIMO_IDENTITY_ID`, `MATIMO_TENANT_ID` | Identity without a credentials file (containers, CI) | from file |
 | `MATIMO_PRIVATE_KEY` or `MATIMO_PRIVATE_KEY_FILE` | Private key PEM inline or by path | from file |
+| `MATIMO_TOOL_CHECK_FAILURE_MODE` | `fail_closed` or `fail_open_bounded` (see "When Gateway is down") | `fail_closed` |
+| `MATIMO_FAIL_OPEN_MAX_STALE_SECONDS` | How stale `fail_open_bounded` may be. Larger than 300 is rejected. | `300` |
 
 You normally never set `MATIMO_TENANT_ID` yourself. It is saved in the credentials file at registration. It is only needed when you skip that file and supply the whole identity through environment variables.
 
-`GatewayConfig` fields you may set in code: `connect_timeout` (10 s), `read_timeout` (30 s), `telemetry_flush_interval` (5 s), `telemetry_batch_size` (50), `telemetry_queue_max` (2000), `heartbeat_interval` (derived from the server's staleness window, clamped to 15 s to 5 min), `fail_open_telemetry` (True: a reporting outage never blocks the agent), `signing_enabled` (True), `credentials_dir`.
+`GatewayConfig` fields you may set in code: `connect_timeout` (10 s), `read_timeout` (30 s), `telemetry_flush_interval` (5 s), `telemetry_batch_size` (50), `telemetry_queue_max` (2000), `heartbeat_interval` (derived from the server's staleness window, clamped to 15 s to 5 min), `fail_open_telemetry` (True: a reporting outage never blocks the agent), `signing_enabled` (True), `credentials_dir`, `tool_check_failure_mode` (`"fail_closed"`), `fail_open_max_stale_seconds` (300, the maximum), `tool_check_breaker_threshold` (3), `tool_check_breaker_cooldown` (30 s), `capture_tool_results` (False).
 
 For a container, mount nothing: set `MATIMO_IDENTITY_TOKEN`, `MATIMO_IDENTITY_ID`, `MATIMO_TENANT_ID` and `MATIMO_PRIVATE_KEY` from your secret store.
 
@@ -415,6 +418,8 @@ Every request that matters (session handshake, LLM calls, tool checks) carries `
 ### Runs and spans
 
 `governor.run(name)` opens a run id that the SDK attaches to LLM calls (`X-Matimo-Run-Id`), tool checks, and every span recorded inside it. `llm_span(...)` and `tool_span(...)` record what happened using OpenTelemetry GenAI attribute names (`gen_ai.request.model`, `gen_ai.tool.name`, token counts). Adapters record these for you.
+
+Every span an adapter or `guard()` records carries the tool's name, arguments (redacted), status and duration. The tool's **result** is not sent unless you set `capture_tool_results=True`; then it goes out as `gen_ai.tool.call.result`, redacted like arguments and cut to 500 characters (for a tool that raised, the error text takes its place). It is off by default because a result can contain anything the tool read.
 
 ### Telemetry and heartbeat
 
@@ -440,6 +445,19 @@ Call `raise_if_suspended()` at the top of long loops, or register `on_suspend` t
 | `ALLOW` | Policy permits the call | runs the function |
 | `DENY` | Policy forbids it; `reason` says why | raises `ToolDenied`, function never runs |
 | `PENDING` | A policy requires approval; `resume_token` identifies the request | polls `POST /v1/tools/check/status` until an admin approves (runs) or rejects (raises `ToolDenied`) |
+
+#### When Gateway is down
+
+A tool check needs Gateway. If it cannot answer at all (a connection error, a timeout, or a 5xx), `tool_check_failure_mode` decides what a tool call does:
+
+- `fail_closed` (default): the tool does not run and `ToolCheckUnavailable` is raised. Adapters hand it to the agent as a recoverable tool error, as they do a DENY.
+- `fail_open_bounded`: the tool runs, only while Gateway was last heard from (a successful check or a heartbeat) within `fail_open_max_stale_seconds`. That value defaults to 300 and can never be higher: a larger one is rejected when the config loads. Past the limit it behaves as `fail_closed`. A call that ran this way has `ToolDecision.degraded == True` and its tool span carries `matimo.degraded_mode=true` and `matimo.degraded_cache_age_seconds`, so a later audit can see exactly which calls ran without a live policy check.
+
+A circuit breaker sits in front of both: after `tool_check_breaker_threshold` (3) consecutive transport failures the SDK stops trying for `tool_check_breaker_cooldown` (30 s) and answers immediately instead of waiting out the retries on every call, then lets one probe through. The first few failing calls each still wait for the transport's retries (about 2 to 4 seconds for a refused connection, longer if packets are dropped).
+
+Whatever the mode, these are never softened: an explicit DENY, an unrecognized decision (a DENY), any 4xx (bad key, missing scope, rejected signature, suspended or revoked agent, rate limit), a suspended state the last heartbeat reported, and anything to do with a PENDING (polling failures, or an outage during the re-check that follows a PENDING with no resume token).
+
+The SDK does not hold your policy, so `fail_open_bounded` does not know whether a tool you have not checked yet would have been allowed. It adds one guard of its own: it will not fail open for a tool whose most recent decision in this process was DENY or PENDING. Keep `fail_closed` if a tool you have not just seen allowed must never run during an outage. Call `governor.start()` so heartbeats count as contact.
 
 Only the category Gateway resolves is trusted. `set_tool_category(name, category)` and the `category=` hint let you tell the server how to classify a tool, and an admin can override it. After the function returns, `guard()` reports the outcome through `POST /v1/tools/result` and records a tool span.
 
@@ -482,7 +500,9 @@ model = gateway_chat_model(governor, model="gpt-4o-mini").bind_tools(tools)
 result = model.invoke(messages, config={"callbacks": [MatimoCallbackHandler(governor)]})
 ```
 
-`gateway_chat_model(provider="openai")` signs every request. `provider="anthropic"` sends the session header only. A DENY raises LangChain's `ToolException`. Set `handle_tool_error=True` on the tool to turn it into an observation string the agent can reason about. `AsyncMatimoCallbackHandler` exists for async chains.
+`gateway_chat_model(provider="openai")` signs every request. `provider="anthropic"` sends the session header only. A DENY, and a fail-closed Gateway outage, raise LangChain's `ToolException`. Set `handle_tool_error=True` on the tool to turn it into an observation string the agent can reason about. `AsyncMatimoCallbackHandler` exists for async chains.
+
+One span per tool call: a tool wrapped by `govern_tools()` is reported by the wrapper (it is the one that sees the decision), with LangChain's own run and span ids so it sits in the chain's run, and the callback handler skips its own span for that call. A tool that is not wrapped still gets the handler's span. A denied call's span is tied to LangChain's run tree only when a Matimo handler is attached. LLM spans carry `gen_ai.provider.name` (`openai`, `anthropic` or `google`) taken from the client class; an unknown class gives no provider, and through Gateway it names the client, not necessarily the upstream provider.
 
 ### Google ADK
 
@@ -493,7 +513,7 @@ agent = Agent(name="weather", model=gateway_model(governor, model="gpt-4o-mini")
 runner = InMemoryRunner(agent=agent, plugins=[MatimoPlugin(governor)])
 ```
 
-One plugin governs every model and tool call the runner makes. A DENY is returned through ADK's own before-tool short-circuit, so the agent sees a structured refusal rather than a crash. LLM calls carry the live session token and the ADK invocation id as the run id. They are not signed per request (litellm builds the body after the hook), so keep `requireSignedRequests` off for ADK identities or route through a custom `BaseLlm` built on `governor.httpx_client()`.
+One plugin governs every model and tool call the runner makes. A DENY, and a fail-closed Gateway outage, are returned through ADK's own before-tool short-circuit, so the agent sees a structured refusal rather than a crash. LLM calls carry the live session token and the ADK invocation id as the run id. They are not signed per request (litellm builds the body after the hook), so keep `requireSignedRequests` off for ADK identities or route through a custom `BaseLlm` built on `governor.httpx_client()`.
 
 ### CrewAI
 
@@ -507,7 +527,7 @@ with governor.run("research"):
     crew.kickoff()
 ```
 
-`gateway_llm()` installs a transport interceptor, so every CrewAI LLM request carries the live session token, the run id, and a per-request signature. It also emits one LLM span per call (duration, status, model, token usage when the response isn't streamed) alongside the tool spans `govern_tool()`/`govern_crew()` already record. `govern_tool(tool, governor)` governs a single tool. CrewAI exposes no per-`kickoff()` id, so `with governor.run(...):` (shown above) is what makes the LLM and tool spans of one crew execution share a run id in the Observability Hub timeline. Without it, each call gets its own uncorrelated id.
+`gateway_llm()` installs a transport interceptor, so every CrewAI LLM request carries the live session token, the run id, and a per-request signature. It also emits one LLM span per call (duration, status, model, token usage when the response isn't streamed) alongside the tool spans `govern_tool()`/`govern_crew()` already record. `govern_tool(tool, governor)` governs a single tool. CrewAI exposes no per-`kickoff()` id, so it cannot group a crew into one run automatically: `with governor.run(...):` (shown above) is the grouping mechanism, and what makes the LLM and tool spans of one crew execution share a run id in the Observability Hub timeline. Without it, each call gets its own uncorrelated id.
 
 ### AutoGen 0.7
 
@@ -521,7 +541,7 @@ async with governor.run("calc-run"):
     await agent.on_messages([TextMessage(content=question, source="user")], CancellationToken())
 ```
 
-Full per-request signing. `gateway_model_client()` needs an `AsyncGovernor`, because AutoGen's model clients are async-only. `govern_tools()` works with either kind of governor. `gateway_model_client()` also wraps the model client's `create()`/`create_stream()` to emit one LLM span per call (duration, status, model, token usage/finish reason from AutoGen's own typed `CreateResult`). AutoGen exposes no per-chat id to this wrapper, so `async with governor.run(...):` (shown above) is what makes the LLM and tool spans of one chat share a run id in the Observability Hub timeline. Without it, each call gets its own uncorrelated id. Legacy AutoGen 0.2 (`pyautogen`) is not supported. Use the generic adapter.
+Full per-request signing. `gateway_model_client()` needs an `AsyncGovernor`, because AutoGen's model clients are async-only. `govern_tools()` works with either kind of governor. `gateway_model_client()` also wraps the model client's `create()`/`create_stream()` to emit one LLM span per call (duration, status, model, token usage/finish reason from AutoGen's own typed `CreateResult`). AutoGen exposes no per-chat id to this wrapper, so it cannot group a chat into one run automatically: `async with governor.run(...):` (shown above) is the grouping mechanism, and what makes the LLM and tool spans of one chat share a run id in the Observability Hub timeline. Without it, each call gets its own uncorrelated id. Legacy AutoGen 0.2 (`pyautogen`) is not supported. Use the generic adapter.
 
 ### Anything else
 

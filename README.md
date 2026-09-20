@@ -171,6 +171,18 @@ the community `ag2` package), wrap your registered functions with
 `matimo_agdk.adapters.generic.govern()` directly -- it works with any
 plain callable.
 
+**Spans and runs, by design.** LangChain reports one tool span per call: when a
+tool is wrapped by `govern_tools()` the wrapper is canonical (it sees the
+decision) and the callback handler skips its own span for that call; a tool that
+is not wrapped still gets the handler's span. A denied call's span is tied to
+LangChain's run tree (its run and span ids) only when a Matimo callback handler
+is attached, since that is what tells the wrapper which run it is inside. CrewAI
+and AutoGen give the SDK no per-crew or per-chat id, so they cannot group a crew
+or chat into one run on their own: wrap the call in `governor.run()` (or
+`async with governor.run()`), which is the grouping mechanism. LangChain LLM
+spans carry `gen_ai.provider.name` (`openai`, `anthropic`, `google`) derived from
+the client class; an unknown class gives no provider.
+
 See `examples/{langchain,google_adk,crewai,autogen}_agent.py` for a
 runnable end-to-end demo of each, and each adapter module's own docstring
 for the full detail this table compresses.
@@ -214,6 +226,50 @@ next, on two different timescales:
   being suspended. There is no push-based kill channel in v1 -- see
   `docs/SERVER-CONTRACT.md` section 10.
 
+## When Gateway is unreachable
+
+A tool check needs Gateway. What a tool call does when Gateway cannot answer at
+all (a connection error, a timeout, a 5xx) is your choice, per agent:
+
+| `tool_check_failure_mode` | What happens |
+|---|---|
+| `fail_closed` (default) | The tool does not run. `guard()` raises `ToolCheckUnavailable` (a `GatewayUnavailable`). Every adapter returns it as a recoverable tool error, the way it returns a DENY: LangChain a `ToolException` (an observation when the tool has `handle_tool_error=True`), ADK an `{"error": ...}` dict from `before_tool_callback`, CrewAI and AutoGen a raised exception their own tool loop turns into an error result. |
+| `fail_open_bounded` | The tool runs, but only while Gateway was last heard from within `fail_open_max_stale_seconds` (default 300, and **hard-capped at 300**: a larger value is rejected when the config loads). Otherwise it behaves as `fail_closed`. |
+
+"Heard from" means a successful tool check or a telemetry heartbeat (so call
+`governor.start()`; without it only successful checks count). A call that ran
+this way is marked: `ToolDecision.degraded` is True, and its tool span carries
+`matimo.degraded_mode=true` and `matimo.degraded_cache_age_seconds`.
+
+**Circuit breaker.** After `tool_check_breaker_threshold` (default 3)
+consecutive transport failures the circuit opens for
+`tool_check_breaker_cooldown` seconds (default 30) and checks fail fast, without
+touching the network, instead of waiting out the transport's retries on every
+call. After the cooldown one probe goes through; any real answer from Gateway
+closes the circuit, a failed probe re-opens it. The first N failing calls each
+still wait out the retry budget (about 2 to 4 seconds when the connection is
+refused, much longer if packets are silently dropped, because each attempt can
+wait for `connect_timeout` or `read_timeout`).
+
+**Never softened, whatever the mode:**
+
+- an explicit `DENY`, and an unrecognized decision (already a `DENY`);
+- any 4xx: a bad key, a missing scope, a rejected signature, a suspended or
+  revoked agent, a rate limit. These raise as before and do not trip the breaker;
+- a suspended or emergency-stopped state the last heartbeat reported;
+- a `PENDING` awaiting approval: polling failures raise, and so does an outage
+  during the re-check that follows a `PENDING` with no resume token.
+
+**What `fail_open_bounded` cannot know.** The SDK does not hold your policy and
+does not replay Gateway's last answer for a tool. Beyond the freshness rule it
+adds one guard: it will not fail open for a tool whose most recent decision in
+this process was `DENY` or `PENDING`, so a tool that needs approval is never
+waved through by an outage. A tool it has not checked before is allowed if
+Gateway was heard from recently. If that is not acceptable for your tools, keep
+`fail_closed`. This concerns tool checks only: LLM calls go through Gateway and
+fail closed with it, and reporting failures are governed separately by
+`fail_open_telemetry`.
+
 ## Configuration
 
 `GatewayConfig` loads with this precedence, highest wins: explicit kwargs
@@ -231,6 +287,18 @@ variables > the credentials file written by `matimo-agdk register`.
 | `MATIMO_PRIVATE_KEY_FILE` | Path to a private key PEM file |
 | `MATIMO_AGENT_NAME` | Agent name (credentials file key, and default displayName) |
 | `MATIMO_FRAMEWORK` | `langchain` \| `google-adk` \| `crewai` \| `autogen` \| `custom` |
+| `MATIMO_TOOL_CHECK_FAILURE_MODE` | `fail_closed` (default) \| `fail_open_bounded`; see "When Gateway is unreachable" |
+| `MATIMO_FAIL_OPEN_MAX_STALE_SECONDS` | How stale `fail_open_bounded` may be, in seconds (default and maximum 300) |
+
+Code-only settings on `GatewayConfig`: `tool_check_breaker_threshold` (3),
+`tool_check_breaker_cooldown` (30 s), and `capture_tool_results` (False).
+
+**Tool results are not sent by default.** With `capture_tool_results=True`,
+every adapter and `guard()` put the tool's result (or, when the tool raised, its
+error text) on the tool span as `gen_ai.tool.call.result`: redacted the same way
+as arguments, then cut to 500 characters. Off by default because a result can
+hold anything the tool read. Google ADK and the LangChain callback handler used
+to send it unconditionally; that changed, see the CHANGELOG.
 
 ## CLI
 
