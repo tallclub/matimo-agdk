@@ -1,0 +1,343 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Matimo Gateway /v1, the routes matimo-agdk uses",
+    "version": "1.0.0-agdk.1",
+    "description": "A hand-derived, machine-readable description of the /v1 routes the AGDK SDK calls. It is NOT the canonical spec: it was written on 2026-09-20 by reading the Zod schemas in Universal-AgentForge/src/backend/src/api/v1/gateway.ts (registerIdentitySchema, telemetryBatchSchema, toolCheckSchema, toolCheckStatusSchema, toolResultSchema, toolCategorySchema, GatewayHeartbeat in domains/gateway/types.ts) and docs/SERVER-CONTRACT.md. Where the two disagree the code wins (SERVER-CONTRACT.md still says 1 to 500 telemetry events and four frameworks; the code allows 0 to 500 and six). Constraints (maxLength, maxItems, strictness) are copied from the schemas because they are exactly what a client can violate. Universal-AgentForge should publish the canonical, generated document (BUILD-PLAN D16); when it does, this file should be replaced by it."
+  },
+  "servers": [{ "url": "http://localhost:8000/v1" }],
+  "paths": {
+    "/sessions": {
+      "post": {
+        "operationId": "createSession",
+        "summary": "Mandatory signed handshake; returns the session token used for telemetry and the LLM proxy.",
+        "parameters": [
+          { "$ref": "#/components/parameters/Authorization" },
+          { "$ref": "#/components/parameters/IdentityToken" },
+          { "$ref": "#/components/parameters/AgentSignature" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionRequest" } } }
+        },
+        "responses": {
+          "201": { "description": "Session created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionResponse" } } } },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/telemetry/batch": {
+      "post": {
+        "operationId": "ingestTelemetry",
+        "summary": "Batch of run/llm/tool/log/error spans; an empty batch is a pure heartbeat poll. Not signed.",
+        "parameters": [
+          { "$ref": "#/components/parameters/Authorization" },
+          { "$ref": "#/components/parameters/SessionToken" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TelemetryBatchRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Accepted, with the heartbeat", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TelemetryBatchResponse" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/tools/check": {
+      "post": {
+        "operationId": "checkTool",
+        "parameters": [
+          { "$ref": "#/components/parameters/Authorization" },
+          { "$ref": "#/components/parameters/IdentityToken" },
+          { "$ref": "#/components/parameters/AgentSignature" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ToolCheckRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Decision", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ToolCheckResponse" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/tools/check/status": {
+      "post": {
+        "operationId": "pollToolCheck",
+        "parameters": [
+          { "$ref": "#/components/parameters/Authorization" },
+          { "$ref": "#/components/parameters/IdentityToken" },
+          { "$ref": "#/components/parameters/AgentSignature" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ToolCheckStatusRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Decision so far", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ToolCheckStatusResponse" } } } },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/tools/result": {
+      "post": {
+        "operationId": "reportToolResult",
+        "parameters": [
+          { "$ref": "#/components/parameters/Authorization" },
+          { "$ref": "#/components/parameters/IdentityToken" },
+          { "$ref": "#/components/parameters/AgentSignature" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ToolResultRequest" } } }
+        },
+        "responses": {
+          "202": { "description": "Accepted (always)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ToolResultResponse" } } } },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/tools/{toolName}/category": {
+      "put": {
+        "operationId": "setToolCategory",
+        "summary": "Tenant-wide admin action (identity:manage scope); no identity token, not signed.",
+        "parameters": [
+          { "$ref": "#/components/parameters/Authorization" },
+          { "name": "toolName", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 255 } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ToolCategoryRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Updated row", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ToolCategoryResponse" } } } },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/identities": {
+      "post": {
+        "operationId": "registerIdentity",
+        "summary": "Register an external agent; the private key is returned exactly once. Not signed.",
+        "parameters": [{ "$ref": "#/components/parameters/Authorization" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RegisterIdentityRequest" } } }
+        },
+        "responses": {
+          "201": { "description": "Identity with one-time key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IdentityResponse" } } } },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/identities/{agentId}/rotate-key": {
+      "post": {
+        "operationId": "rotateIdentityKey",
+        "parameters": [
+          { "$ref": "#/components/parameters/Authorization" },
+          { "name": "agentId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RotateKeyRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Identity with a new one-time key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IdentityResponse" } } } },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "Authorization": { "name": "Authorization", "in": "header", "required": true, "description": "Bearer <org API key>", "schema": { "type": "string", "pattern": "^Bearer .+" } },
+      "IdentityToken": { "name": "X-Matimo-Agent-Identity-Token", "in": "header", "required": true, "schema": { "type": "string", "minLength": 1 } },
+      "SessionToken": { "name": "X-Matimo-Session-Token", "in": "header", "required": true, "schema": { "type": "string", "minLength": 1 } },
+      "AgentSignature": { "name": "Matimo-Agent-Signature", "in": "header", "required": true, "description": "Compact ES256 JWS over the exact request body bytes", "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$" } }
+    },
+    "responses": {
+      "Error": { "description": "Flat error envelope", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": { "error": { "type": "string" }, "message": { "type": "string" } }
+      },
+      "Decision": { "type": "string", "enum": ["ALLOW", "DENY", "PENDING"] },
+      "SessionRequest": { "type": "object", "additionalProperties": false, "maxProperties": 0 },
+      "SessionResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["sessionToken", "expiresAt", "identityId"],
+            "properties": {
+              "sessionToken": { "type": "string", "pattern": "^me-sess-[0-9a-f]{64}$" },
+              "expiresAt": { "type": "string", "format": "date-time" },
+              "identityId": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      },
+      "TelemetryEvent": {
+        "type": "object",
+        "required": ["runId", "kind"],
+        "properties": {
+          "runId": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "sessionId": { "type": "string", "maxLength": 120 },
+          "spanId": { "type": "string", "maxLength": 120 },
+          "parentSpanId": { "type": "string", "maxLength": 120 },
+          "kind": { "type": "string", "enum": ["run", "llm", "tool", "log", "error"] },
+          "name": { "type": "string", "maxLength": 255 },
+          "status": { "type": "string", "maxLength": 20 },
+          "startedAt": { "oneOf": [{ "type": "string" }, { "type": "number" }] },
+          "durationMs": { "type": "integer", "minimum": 0 },
+          "attributes": { "type": "object" }
+        }
+      },
+      "TelemetryBatchRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["events"],
+        "properties": { "events": { "type": "array", "minItems": 0, "maxItems": 500, "items": { "$ref": "#/components/schemas/TelemetryEvent" } } }
+      },
+      "Heartbeat": {
+        "type": "object",
+        "required": ["lifecycleStatus", "emergencyStop", "telemetryMode", "telemetryStalenessMinutes", "serverTime"],
+        "properties": {
+          "lifecycleStatus": { "type": "string", "enum": ["active", "suspended", "revoked", "unknown"] },
+          "emergencyStop": { "type": "boolean" },
+          "telemetryMode": { "type": "string", "enum": ["advisory", "deny"] },
+          "telemetryStalenessMinutes": { "type": "number", "exclusiveMinimum": 0 },
+          "serverTime": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TelemetryBatchResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["accepted", "failed", "heartbeat"],
+            "properties": {
+              "accepted": { "type": "integer", "minimum": 0 },
+              "failed": {
+                "type": "array",
+                "items": { "type": "object", "required": ["index", "error"], "properties": { "index": { "type": "integer", "minimum": 0 }, "error": { "type": "string" } } }
+              },
+              "heartbeat": { "$ref": "#/components/schemas/Heartbeat" }
+            }
+          }
+        }
+      },
+      "ToolCheckRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["toolName", "argHash"],
+        "properties": {
+          "toolName": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "toolCategory": { "type": "string", "maxLength": 50 },
+          "argHash": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "args": { "type": "object" }
+        }
+      },
+      "ToolCheckResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["decision"],
+            "properties": {
+              "decision": { "$ref": "#/components/schemas/Decision" },
+              "reason": { "type": "string" },
+              "resumeToken": { "type": "string", "minLength": 1 },
+              "requestId": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      },
+      "ToolCheckStatusRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["resumeToken"],
+        "properties": { "resumeToken": { "type": "string", "minLength": 1 } }
+      },
+      "ToolCheckStatusResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["decision"],
+            "properties": { "decision": { "$ref": "#/components/schemas/Decision" }, "reason": { "type": "string" } }
+          }
+        }
+      },
+      "ToolResultRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["resumeToken", "status"],
+        "properties": {
+          "resumeToken": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "minLength": 1, "maxLength": 20 },
+          "durationMs": { "type": "integer", "minimum": 0 },
+          "error": { "type": "string", "maxLength": 2000 }
+        }
+      },
+      "ToolResultResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": { "data": { "type": "object", "required": ["accepted"], "properties": { "accepted": { "const": true } } } }
+      },
+      "ToolCategoryRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category"],
+        "properties": { "category": { "type": "string", "minLength": 1, "maxLength": 50 } }
+      },
+      "ToolCategoryResponse": { "type": "object", "required": ["data"], "properties": { "data": { "type": "object" } } },
+      "RegisterIdentityRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["displayName", "externalFramework"],
+        "properties": {
+          "displayName": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "externalFramework": { "type": "string", "enum": ["langchain", "crewai", "google-adk", "google_adk", "autogen", "custom"] },
+          "allowedToolCategories": { "type": "array", "items": { "type": "string" } },
+          "allowedLlmModels": { "type": "array", "items": { "type": "string" } },
+          "registrationMetadata": { "type": "object" }
+        }
+      },
+      "RotateKeyRequest": { "type": "object", "additionalProperties": false, "maxProperties": 0 },
+      "IdentityResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["id", "tenantId", "identityToken", "displayName", "privateKeyPem"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "tenantId": { "type": "string", "minLength": 1 },
+              "identityToken": { "type": "string", "pattern": "^me-id-[A-Za-z0-9]{24}$" },
+              "displayName": { "type": "string" },
+              "externalFramework": { "type": ["string", "null"] },
+              "privateKeyPem": { "type": "string", "pattern": "^-----BEGIN PRIVATE KEY-----" },
+              "publicKeyFingerprint": { "type": "string" },
+              "createdAt": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
