@@ -181,6 +181,16 @@ def _save_or_explain(identity: IdentityCredentials, credentials_dir: Any) -> Non
         ) from exc
 
 
+def _run_end_span(run_id: str, name: str, status: str, started: float) -> dict[str, Any]:
+    return run_span(
+        run_id,
+        name=name,
+        status=status,
+        session_id=run_id,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+
 def _positional_to_kwargs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
     """Best-effort reconstruction of "the tool's arguments" as a dict, for
     hashing and for the human-reviewer-facing `args` field on a PENDING
@@ -408,30 +418,17 @@ class Governor:
         self._emit(
             run_span(run_id, name=name, status="running", session_id=run_id, started_at=_now_iso())
         )
+        status = "completed"
         try:
             yield run_id
-        except Exception:
-            self._emit(
-                run_span(
-                    run_id,
-                    name=name,
-                    status="failed",
-                    session_id=run_id,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                )
-            )
+        except BaseException as exc:
+            # Gateway only ends a run on an explicit terminal span. A task
+            # cancellation or KeyboardInterrupt is not an `Exception`, so the
+            # old `except Exception` left such runs `running` until the sweep.
+            status = "failed" if isinstance(exc, Exception) else "cancelled"
             raise
-        else:
-            self._emit(
-                run_span(
-                    run_id,
-                    name=name,
-                    status="completed",
-                    session_id=run_id,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                )
-            )
         finally:
+            self._emit(_run_end_span(run_id, name, status, started))
             _current_run.reset(token)
 
     def _emit(self, event: dict[str, Any]) -> None:
@@ -941,30 +938,17 @@ class AsyncGovernor:
         self._emit(
             run_span(run_id, name=name, status="running", session_id=run_id, started_at=_now_iso())
         )
+        status = "completed"
         try:
             yield run_id
-        except Exception:
-            self._emit(
-                run_span(
-                    run_id,
-                    name=name,
-                    status="failed",
-                    session_id=run_id,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                )
-            )
+        except BaseException as exc:
+            # Gateway only ends a run on an explicit terminal span. A task
+            # cancellation or KeyboardInterrupt is not an `Exception`, so the
+            # old `except Exception` left such runs `running` until the sweep.
+            status = "failed" if isinstance(exc, Exception) else "cancelled"
             raise
-        else:
-            self._emit(
-                run_span(
-                    run_id,
-                    name=name,
-                    status="completed",
-                    session_id=run_id,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                )
-            )
         finally:
+            self._emit(_run_end_span(run_id, name, status, started))
             _current_run.reset(token)
 
     def _emit(self, event: dict[str, Any]) -> None:
