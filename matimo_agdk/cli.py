@@ -12,8 +12,9 @@ import argparse
 import sys
 from typing import Any
 
+from . import __version__
 from .config import DEFAULT_BASE_URL, GatewayConfig
-from .exceptions import GatewayError
+from .exceptions import GatewayError, SigningError
 from .governor import Governor
 from .identity import credentials_paths
 
@@ -141,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="matimo-agdk", description="Matimo Agent Governance Development Kit CLI"
     )
+    parser.add_argument("--version", action="version", version=f"matimo-agdk {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
@@ -193,7 +195,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    sys.exit(args.func(args))
+    try:
+        code = args.func(args)
+    except GatewayError as exc:
+        print(f"error: {exc.message}", file=sys.stderr)
+        code = 1
+    except (SigningError, ValueError) as exc:
+        # SigningError: a malformed private key in the credentials file or env.
+        # ValueError (incl. pydantic.ValidationError): bad configuration values.
+        # A user running `doctor` wants the diagnosis, not a traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        code = 1
+    sys.exit(code)
 
 
 if __name__ == "__main__":
