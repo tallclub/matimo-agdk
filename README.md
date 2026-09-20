@@ -24,10 +24,7 @@ support.
 
 Not on PyPI yet: until it is, install from a checkout of this repository
 (`pip install -e ".[all]"` or `uv sync --all-extras`). The commands below
-show the intended PyPI form.
-
-The full guide, from getting an API key to operating an agent, is [docs/USER-MANUAL.md](docs/USER-MANUAL.md).
-
+show the intended PyPI form. Python 3.13 or newer is required.
 
 ```bash
 pip install matimo-agdk
@@ -44,6 +41,8 @@ pip install matimo-agdk[autogen]
 pip install matimo-agdk[all]
 ```
 
+The full guide, from getting an API key to operating an agent, is [docs/USER-MANUAL.md](docs/USER-MANUAL.md).
+
 ## Quickstart
 
 1. Register the agent once (per machine, not per run) and get an org API
@@ -59,7 +58,10 @@ pip install matimo-agdk[all]
    private key is returned by the server exactly once, at registration --
    there is no way to retrieve it again. Losing it means registering fresh,
    or rotating the key if you still hold the identity and the org API key
-   (`matimo-agdk rotate-key --name my-agent`).
+   (`matimo-agdk rotate-key --name my-agent`). `register` refuses to run
+   again for a name that already has credentials (a second registration
+   would create a second identity and destroy the first one's key); pass
+   `--force` only when you really mean to replace them.
 
 2. Build a Governor from the persisted credentials:
 
@@ -88,19 +90,27 @@ pip install matimo-agdk[all]
    ```python
    import openai
 
-   # Simple: works today, and works once a tenant later enables
-   # requireSignedRequests too, since the header carries the session token.
+   # Quick: attaches the session token once, when the client is built. It is
+   # not refreshed (a session lasts one hour by default) and nothing is
+   # signed, so it stops working when the session expires, and it never works
+   # for an identity whose tenant enforces requireSignedRequests. Fine for a
+   # short script; not for a long-running agent.
    client = openai.OpenAI(**governor.openai_client_kwargs())
 
-   # Full: also signs every request. Needed if signing enforcement might
-   # ever turn on for this identity -- costs nothing when it's off, so this
-   # is the recommended default rather than an opt-in.
+   # Recommended: attaches a live session token and signs every request, and
+   # transparently re-handshakes if the session expires mid-run. Signing costs
+   # nothing when the tenant does not enforce it.
    client = openai.OpenAI(
        base_url=governor.config.base_url,
        api_key=governor.config.api_key,
        http_client=governor.httpx_client(),
    )
    ```
+
+   For Anthropic, use `governor.anthropic_http_client()` instead of
+   `httpx_client()`: `anthropic` 1.6 and newer are built on `httpx2` and reject
+   an `httpx.Client`. The helper returns whichever client the installed
+   release accepts (`pip install httpx2` if it is missing).
 
    `default_headers=` alone cannot carry a per-request signature: the
    signature covers the exact bytes of each request's own body, which is
@@ -133,6 +143,15 @@ before assuming attaching a callback/plugin alone is enough.
 | CrewAI | `govern_crew(crew_or_agents, governor)` | `gateway_llm()` | The wrapped `_run`/`_arun` on each tool | Full: live session token, run id, and per-request JWS via CrewAI's transport interceptor (verified live with `requireSignedRequests=true`) | crewai 1.15.22 |
 | AutoGen | `govern_tools(tools, governor)` | `gateway_model_client()` | The wrapped `run()` on each `BaseTool` | Full | autogen-core/-agentchat/-ext 0.7.5 (modern generation only -- see below) |
 | Any other framework | `govern(callable_or_tools, governor)` | build your own client with `governor.openai_client_kwargs()`/`httpx_client()` | `governor.guard()` under the hood | Depends on your client | No framework dependency at all |
+
+**Sync vs. async governors.** `gateway_chat_model()` (LangChain),
+`gateway_model()` (ADK) and `gateway_llm()` (CrewAI) build their clients
+synchronously, so they need a sync `Governor`; passing an `AsyncGovernor`
+raises a `TypeError` that says so. A sync `Governor` still serves async
+framework code (blocking calls are moved to a thread). `gateway_model_client()`
+(AutoGen) is the reverse: it needs an `AsyncGovernor`. LangChain's `ChatOpenAI`
+is wired with the live sync client only, so its async methods (`ainvoke`) fall
+back to a session header fixed at construction and are not signed.
 
 **"Session-header-only" means**: the session token is attached, but there
 is no per-request `Matimo-Agent-Signature` (nonce + body hash) the way
@@ -237,16 +256,16 @@ uv run ruff check .
 uv run mypy matimo_agdk
 ```
 
-Every test in `tests/` mocks HTTP with `respx` (see `CONTRIBUTING.md`), so
-this proves the client builds correct requests and handles every scripted
-response shape correctly -- signing, retries, redaction, adapter wiring --
-without needing Gateway, Postgres, or a license. This is the check to run
-on every change, and the one CI runs.
+No test touches the network: HTTP is mocked with `respx` or in-process fakes
+(see `CONTRIBUTING.md`), so this proves the client builds correct requests and
+handles every scripted response shape correctly -- signing, retries,
+redaction, adapter wiring -- without needing Gateway, Postgres, or a license.
+This is the check to run on every change, and the one CI runs.
 
 ### 2. CLI sanity check -- a real Gateway, no code
 
-Once a local Matimo Gateway is reachable (Universal-AgentForge's backend,
-default `http://localhost:8000/v1`) and you have an org API key from a
+Once a local Matimo Gateway is reachable (part of the Matimo Workbench
+backend, default `http://localhost:8000/v1`) and you have an org API key from a
 tenant admin:
 
 ```bash

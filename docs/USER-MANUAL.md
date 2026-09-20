@@ -457,14 +457,16 @@ Only the category Gateway resolves is trusted. `set_tool_category(name, category
 | `check_tool(name, args)` / `await_decision(resume_token)` | The two steps by hand. `check_tool` can return PENDING with no `resume_token`; treat that as "not approved yet", never as "go ahead" |
 | `set_tool_category(name, category)` | Classify a tool server-side |
 | `httpx_client()` | Signed, session-aware `httpx.Client` for any OpenAI-compatible SDK |
-| `openai_client_kwargs()` / `anthropic_client_kwargs()` | `base_url`, `api_key`, `default_headers` for those SDKs; pass `http_client=governor.httpx_client()` too |
+| `httpx2_client()` | The same, as an `httpx2.Client`, for SDKs built on `httpx2` (anthropic 1.6 and newer reject an `httpx.Client`) |
+| `anthropic_http_client()` | The right one of the two for the installed `anthropic` release |
+| `openai_client_kwargs()` / `anthropic_client_kwargs()` | `base_url`, `api_key`, `default_headers` for those SDKs; also pass `http_client=governor.httpx_client()` (OpenAI) or `http_client=governor.anthropic_http_client()` (Anthropic) for a live, signed client |
 | `request_headers(body=None)` | Live headers (and signature over `body`) for a client you build yourself |
 | `bind_run_id(run_id)` | Attach a framework-owned run id without opening a span |
 | `state` / `is_suspended()` / `raise_if_suspended()` / `on_suspend(cb)` | Heartbeat-driven governance state |
 | `rotate_key()` | New keypair; the old key stops verifying immediately |
 | `identity` | The bound `IdentityCredentials` |
 
-`AsyncGovernor` mirrors this with `await` on `register`, `start`, `stop`, `check_tool`, `await_decision`, `set_tool_category`, `rotate_key`, `request_headers`, and `httpx_async_client()`.
+`AsyncGovernor` mirrors this with `await` on `register`, `start`, `stop`, `check_tool`, `await_decision`, `set_tool_category`, `rotate_key`, `request_headers`, `httpx_async_client()`, `httpx2_async_client()` and `anthropic_http_client()`.
 
 ## 12. Framework adapters in detail
 
