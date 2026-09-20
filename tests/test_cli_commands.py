@@ -9,7 +9,8 @@ from pathlib import Path
 import httpx
 import respx
 
-from matimo_agdk import cli, identity as identity_mod
+from matimo_agdk import cli
+from matimo_agdk import identity as identity_mod
 from matimo_agdk.identity import IdentityCredentials, load_credentials, save_credentials
 
 from .conftest import BASE_URL, future_iso
@@ -23,7 +24,9 @@ def _mock_session_and_heartbeat(lifecycle: str = "active") -> None:
     respx.post(f"{BASE_URL}/sessions").mock(
         return_value=httpx.Response(
             201,
-            json={"data": {"sessionToken": "tok", "expiresAt": future_iso(3600), "identityId": "x"}},
+            json={
+                "data": {"sessionToken": "tok", "expiresAt": future_iso(3600), "identityId": "x"}
+            },
         )
     )
     respx.post(f"{BASE_URL}/telemetry/batch").mock(
@@ -73,7 +76,9 @@ def test_cmd_doctor_passes_end_to_end(
     assert identity.private_key_pem not in out
 
 
-def test_cmd_status_without_identity_fails_cleanly(credentials_dir: Path, monkeypatch, capsys) -> None:
+def test_cmd_status_without_identity_fails_cleanly(
+    credentials_dir: Path, monkeypatch, capsys
+) -> None:
     monkeypatch.setattr(identity_mod, "DEFAULT_CREDENTIALS_DIR", credentials_dir)
     assert cli.cmd_status(_args("nobody")) == 1
     assert "no identity found" in capsys.readouterr().err

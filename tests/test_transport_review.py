@@ -79,7 +79,10 @@ async def test_async_session_retry_transport_resends_once(identity: IdentityCred
     inner = _FakeInner()
     session = _FakeAsyncSession()
     transport = AsyncSessionRetryTransport(
-        inner, session, JWSSigner.from_credentials(identity), signing_enabled=True  # type: ignore[arg-type]
+        inner,
+        session,
+        JWSSigner.from_credentials(identity),
+        signing_enabled=True,  # type: ignore[arg-type]
     )
     async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as client:
         resp = await client.post(

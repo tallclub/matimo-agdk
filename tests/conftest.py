@@ -41,7 +41,7 @@ def credentials_dir(tmp_path: Path) -> Path:
 def future_iso(seconds: float) -> str:
     import datetime as dt
 
-    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).isoformat()
+    return (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds)).isoformat()
 
 
 def make_session_response(

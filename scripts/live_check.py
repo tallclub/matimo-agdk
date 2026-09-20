@@ -1305,7 +1305,9 @@ def scenario_call_log_deny(ctx: Ctx) -> None:
         restore_identity(ctx, identity_id)
 
 
-@scenario("messages route auth: an Anthropic SDK client authenticates to Gateway with Authorization Bearer")
+@scenario(
+    "messages route auth: an Anthropic SDK client authenticates to Gateway with Authorization Bearer"
+)
 def scenario_anthropic_auth(ctx: Ctx) -> None:
     """The Anthropic SDK sends `api_key=` as x-api-key, which Gateway never
     reads; anthropic_client_kwargs() therefore passes the org key as
@@ -1333,10 +1335,19 @@ def scenario_anthropic_auth(ctx: Ctx) -> None:
                 body = exc.body if isinstance(exc.body, dict) else {}
                 code = body.get("error")
                 must(
-                    exc.status_code != 401 and code not in ("unauthorized", "invalid_api_key", "missing_api_key", "session_required"),
+                    exc.status_code != 401
+                    and code
+                    not in (
+                        "unauthorized",
+                        "invalid_api_key",
+                        "missing_api_key",
+                        "session_required",
+                    ),
                     f"Gateway rejected the Anthropic client's credentials: {exc.status_code} {body}",
                 )
-                print(f"    past auth and session gates ({exc.status_code} {code}); no Anthropic provider needed for this check")
+                print(
+                    f"    past auth and session gates ({exc.status_code} {code}); no Anthropic provider needed for this check"
+                )
     finally:
         gov.stop()
 

@@ -64,7 +64,9 @@ async def test_flush_now_sends_queued_events_in_one_batch() -> None:
 
 
 async def test_heartbeat_updates_state_and_raise_if_suspended() -> None:
-    http = AsyncFakeHTTP([{"accepted": 0, "failed": [], "heartbeat": heartbeat(lifecycle="suspended")}])
+    http = AsyncFakeHTTP(
+        [{"accepted": 0, "failed": [], "heartbeat": heartbeat(lifecycle="suspended")}]
+    )
     exporter = AsyncTelemetryExporter(http, AsyncFakeSessionManager(), heartbeat_interval=0.0)
     await exporter.flush_now()
     assert exporter.state.lifecycle_status == "suspended"
