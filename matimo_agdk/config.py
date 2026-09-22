@@ -62,6 +62,15 @@ class GatewayConfig(BaseModel):
     fail_open_telemetry: bool = True
     signing_enabled: bool = True
 
+    # Push channel for rapid suspend and emergency stop (GET /v1/control/stream,
+    # Server-Sent Events). On by default; polling the heartbeat is unchanged and
+    # remains the fallback and the guarantee, so turning this off only gives up
+    # the ~1 s notice. See matimo_agdk.control_stream. Env: MATIMO_CONTROL_STREAM=0.
+    control_stream_enabled: bool = True
+    # Longest silence the stream may have before it is treated as dead and
+    # reconnected. Must exceed the server's keepalive interval (15 s).
+    control_stream_read_timeout: float = Field(default=45.0, gt=0)
+
     # What a tool call does when Gateway cannot answer its check at all (a
     # connection error, timeout or 5xx; never a 4xx and never a DENY). See
     # matimo_agdk._outage. fail_closed is the safe default.
@@ -196,6 +205,13 @@ class GatewayConfig(BaseModel):
             values["tool_check_failure_mode"] = env["MATIMO_TOOL_CHECK_FAILURE_MODE"]
         if env.get("MATIMO_FAIL_OPEN_MAX_STALE_SECONDS"):
             values["fail_open_max_stale_seconds"] = env["MATIMO_FAIL_OPEN_MAX_STALE_SECONDS"]
+        if env.get("MATIMO_CONTROL_STREAM"):
+            values["control_stream_enabled"] = env["MATIMO_CONTROL_STREAM"].strip().lower() not in (
+                "0",
+                "false",
+                "off",
+                "no",
+            )
 
         # 3. Explicit kwargs (highest precedence).
         if agent_name is not None:

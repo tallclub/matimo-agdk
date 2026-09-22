@@ -38,7 +38,7 @@ async def main() -> None:
     question = " ".join(sys.argv[1:]) or "What's the weather in Bengaluru?"
     # Matimo: load the identity created by `matimo-agdk register` (plus the
     # API key / Gateway URL from env vars), then start background telemetry.
-    governor = Governor.from_env(agent_name="google-adk-demo")
+    governor = Governor.from_env(agent_name="google_adk_agent")
     governor.start()
 
     try:

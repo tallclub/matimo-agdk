@@ -870,9 +870,18 @@ def scenario_signed_llm_call(ctx: Ctx) -> None:
 # ---------------------------------------------------------------------------
 
 
-@scenario("rapid suspend: local state flips within one heartbeat, next tool check DENYs live")
+@scenario("rapid suspend (polling only): local state flips within one heartbeat, tool check DENYs")
 def scenario_rapid_suspend(ctx: Ctx) -> None:
-    gov = fresh_governor(ctx, "suspend", telemetry_flush_interval=1.0, heartbeat_interval=2.0)
+    # The push channel is OFF here on purpose: this scenario proves the polled
+    # heartbeat path on its own, which must keep working when the stream is
+    # disabled, unsupported by the server, or down.
+    gov = fresh_governor(
+        ctx,
+        "suspend",
+        telemetry_flush_interval=1.0,
+        heartbeat_interval=2.0,
+        control_stream_enabled=False,
+    )
     identity_id = gov.identity.identity_id  # type: ignore[union-attr]
     gov.start()
     try:
@@ -902,6 +911,108 @@ def scenario_rapid_suspend(ctx: Ctx) -> None:
                 decision.reason == "agent_suspended",
                 f"expected reason=agent_suspended, got {decision.reason!r}",
             )
+        finally:
+            restore_identity(ctx, identity_id)
+    finally:
+        gov.stop()
+
+
+def set_emergency_stop(ctx: Ctx, active: bool) -> None:
+    status, body = api(
+        "POST" if active else "DELETE",
+        "/api/v1/enterprise/emergency-stop",
+        token=ctx.admin_token,
+        json_body={"reason": "AGDK live_check control stream scenario"} if active else None,
+    )
+    must(
+        status in (200, 204),
+        f"emergency stop {'on' if active else 'off'} failed ({status}): {body}",
+    )
+
+
+def wait_for(predicate: Callable[[], bool], timeout: float) -> float | None:
+    """Seconds until `predicate` holds (polled every 10 ms), or None on timeout."""
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if predicate():
+            return time.monotonic() - start
+        time.sleep(0.01)
+    return None
+
+
+@scenario(
+    "control stream (push): suspend, emergency stop and restore reach state in about a second"
+)
+def scenario_control_stream_push(ctx: Ctx) -> None:
+    # Polling is effectively OFF (9999 s), so anything observed within a couple
+    # of seconds can only have come from the push channel.
+    gov = fresh_governor(ctx, "push")
+    identity_id = gov.identity.identity_id  # type: ignore[union-attr]
+    gov.start()
+    try:
+        connected = wait_for(lambda: gov.control_stream_status == "connected", 10.0)
+        must(
+            connected is not None,
+            f"expected the control stream to connect, status={gov.control_stream_status}",
+        )
+        gov._telemetry.flush_now()  # noqa: SLF001 -- baseline heartbeat: active, no stop
+        must(not gov.is_suspended(), f"expected an active baseline, got {gov.state}")
+        polls_before = gov.state.last_polled_monotonic
+
+        # 1. Suspend: tightens from the event itself.
+        t0 = time.monotonic()
+        suspend_identity(ctx, identity_id, "AGDK live_check control stream scenario")
+        try:
+            latency = wait_for(gov.is_suspended, 3.0)
+            must(latency is not None, f"expected a push suspend within 3s, state={gov.state}")
+            print(f"    suspend pushed: {(time.monotonic() - t0) * 1000:.0f} ms (request -> state)")
+            # The push also triggered a confirming poll well before the 9999 s interval.
+            confirmed = wait_for(lambda: gov.state.last_polled_monotonic > polls_before, 3.0)
+            must(confirmed is not None, "expected the push to trigger a confirming heartbeat poll")
+            must(gov.state.lifecycle_status == "suspended", f"unexpected state {gov.state}")
+        finally:
+            # 2. Restore: a relaxing event. It changes state only through the poll it triggers.
+            t1 = time.monotonic()
+            restore_identity(ctx, identity_id)
+        relaxed = wait_for(lambda: not gov.is_suspended(), 3.0)
+        must(
+            relaxed is not None, f"expected the restore to reach state within 3s, state={gov.state}"
+        )
+        print(f"    restore applied: {(time.monotonic() - t1) * 1000:.0f} ms (request -> state)")
+
+        # 3. Emergency stop on, then off (tenant-wide).
+        t2 = time.monotonic()
+        set_emergency_stop(ctx, True)
+        try:
+            stopped = wait_for(lambda: gov.state.emergency_stop, 3.0)
+            must(
+                stopped is not None, f"expected a push emergency stop within 3s, state={gov.state}"
+            )
+            print(f"    emergency stop pushed: {(time.monotonic() - t2) * 1000:.0f} ms")
+        finally:
+            set_emergency_stop(ctx, False)
+        lifted = wait_for(lambda: not gov.state.emergency_stop, 3.0)
+        must(lifted is not None, f"expected the stop to lift in state within 3s, state={gov.state}")
+    finally:
+        gov.stop()
+        must(
+            gov.control_stream_status == "disabled", "expected the stream to stop with the governor"
+        )
+
+
+@scenario("control stream (push): with the flag off, the same suspend is NOT seen without polling")
+def scenario_control_stream_disabled(ctx: Ctx) -> None:
+    # The negative control for the scenario above: same 9999 s polling, push off.
+    gov = fresh_governor(ctx, "push-off", control_stream_enabled=False)
+    identity_id = gov.identity.identity_id  # type: ignore[union-attr]
+    gov.start()
+    try:
+        must(gov.control_stream_status == "disabled", "expected the stream to be disabled")
+        gov._telemetry.flush_now()  # noqa: SLF001
+        suspend_identity(ctx, identity_id, "AGDK live_check control stream scenario (flag off)")
+        try:
+            seen = wait_for(gov.is_suspended, 2.5)
+            must(seen is None, "state changed with polling off and the stream off: not expected")
         finally:
             restore_identity(ctx, identity_id)
     finally:
@@ -1370,25 +1481,29 @@ def main() -> int:
     ctx = provision()
 
     print(
-        "Preflight: confirming the tenant has an active Matimo Enterprise license via a real "
-        "POST /v1/identities call (there is no lighter-weight check, and this script never "
-        "activates a license itself)..."
+        "Preflight: confirming the tenant has an active Matimo Enterprise license via "
+        "GET /v1/health (QUALITY-REVIEW item 11 -- this used to register a throwaway "
+        "identity via POST /v1/identities just to answer this question, before that "
+        "endpoint existed; identities are never deleted server-side, see "
+        "docs/SERVER-CONTRACT.md section 10, so every prior run of this script left an "
+        "inert row behind. This script still never activates a license itself)..."
     )
+    preflight_config = GatewayConfig(base_url=GATEWAY_URL, api_key=ctx.org_api_key)
+    preflight_governor = Governor(preflight_config)
     try:
-        probe = fresh_governor(ctx, "license-preflight")
+        health = preflight_governor.check_health()
     except GatewayError as exc:
         print(
-            f"\nFATAL: the first real Gateway call failed ({exc.code}): {exc.message}\n"
+            f"\nFATAL: GET /v1/health failed ({exc.code}): {exc.message}\n"
             "This script never activates a Matimo Enterprise license, mints an API key, or "
             "creates any other credential -- fix the environment (activate a license for this "
             "tenant, or check MATIMO_API_KEY's scopes/validity) and re-run.",
             file=sys.stderr,
         )
         return 2
-    print(
-        f"  OK -- preflight identity {probe.identity.identity_id} registered "  # type: ignore[union-attr]
-        "(identities are never deleted server-side, see docs/SERVER-CONTRACT.md section 10)"
-    )
+    finally:
+        preflight_governor.close()
+    print(f"  OK -- {health}")
 
     results: list[ScenarioResult] = []
     for name, fn in _REGISTRY:

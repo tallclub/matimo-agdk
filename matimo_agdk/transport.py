@@ -29,7 +29,8 @@ import json
 import math
 import random
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -271,6 +272,33 @@ class GatewayHTTP(_HeaderMixin):
 
             return _finish_response(resp)
 
+    @contextmanager
+    def stream_get(
+        self,
+        path: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        read_timeout: float = 45.0,
+    ) -> Iterator[httpx.Response]:
+        """Opens a long-lived GET whose body is read incrementally (Server-Sent
+        Events). One attempt and no retry: the caller owns reconnection. A
+        >= 400 answer raises the same typed error request() would; a transport
+        failure, including a read timeout while iterating, raises
+        GatewayUnavailable. `read_timeout` bounds the silence between two
+        chunks, so it must exceed the server's keepalive interval."""
+        req_headers = self._base_headers(headers)
+        req_headers.pop("Content-Type", None)
+        req_headers["Accept"] = "text/event-stream"
+        timeout = httpx.Timeout(read_timeout, connect=10.0)
+        try:
+            with self._client.stream("GET", path, headers=req_headers, timeout=timeout) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    _finish_response(resp)  # always raises for >= 400
+                yield resp
+        except httpx.TransportError as exc:
+            raise GatewayUnavailable(str(exc)) from exc
+
 
 class AsyncGatewayHTTP(_HeaderMixin):
     """Async transport. Owns one pooled httpx.AsyncClient."""
@@ -354,3 +382,27 @@ class AsyncGatewayHTTP(_HeaderMixin):
                 continue
 
             return _finish_response(resp)
+
+    @asynccontextmanager
+    async def stream_get(
+        self,
+        path: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        read_timeout: float = 45.0,
+    ) -> AsyncIterator[httpx.Response]:
+        """Async twin of GatewayHTTP.stream_get()."""
+        req_headers = self._base_headers(headers)
+        req_headers.pop("Content-Type", None)
+        req_headers["Accept"] = "text/event-stream"
+        timeout = httpx.Timeout(read_timeout, connect=10.0)
+        try:
+            async with self._client.stream(
+                "GET", path, headers=req_headers, timeout=timeout
+            ) as resp:
+                if resp.status_code >= 400:
+                    await resp.aread()
+                    _finish_response(resp)  # always raises for >= 400
+                yield resp
+        except httpx.TransportError as exc:
+            raise GatewayUnavailable(str(exc)) from exc

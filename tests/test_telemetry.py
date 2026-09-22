@@ -77,14 +77,18 @@ def heartbeat(
     emergency: bool = False,
     mode: str = "advisory",
     staleness: float = 30.0,
+    config_version: Any = None,
 ) -> dict[str, Any]:
-    return {
+    beat: dict[str, Any] = {
         "lifecycleStatus": lifecycle,
         "emergencyStop": emergency,
         "telemetryMode": mode,
         "telemetryStalenessMinutes": staleness,
         "serverTime": "2026-09-18T00:00:00Z",
     }
+    if config_version is not None:
+        beat["configVersion"] = config_version
+    return beat
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +117,67 @@ def test_governance_state_revoked_is_suspended() -> None:
     state = GovernanceState()
     state.update_from_heartbeat(heartbeat(lifecycle="revoked"))
     assert state.is_suspended is True
+
+
+def test_governance_state_config_version_defaults_to_none() -> None:
+    assert GovernanceState().config_version is None
+
+
+def test_governance_state_records_config_version_from_heartbeat() -> None:
+    state = GovernanceState()
+    state.update_from_heartbeat(heartbeat(config_version=7))
+    assert state.config_version == 7
+    state.update_from_heartbeat(heartbeat(config_version=9))
+    assert state.config_version == 9
+
+
+def test_governance_state_accepts_config_version_zero() -> None:
+    state = GovernanceState()
+    state.update_from_heartbeat(heartbeat(config_version=0))
+    assert state.config_version == 0
+
+
+def test_governance_state_keeps_last_config_version_when_heartbeat_has_none() -> None:
+    """An older Gateway (no field) or a failed server-side read (null) is 'no
+    information', never a change and never a reset."""
+    state = GovernanceState()
+    state.update_from_heartbeat(heartbeat(config_version=7))
+    state.update_from_heartbeat(heartbeat())  # field absent
+    assert state.config_version == 7
+    beat = heartbeat()
+    beat["configVersion"] = None  # explicit null from the server
+    state.update_from_heartbeat(beat)
+    assert state.config_version == 7
+
+
+@pytest.mark.parametrize("bad", ["7", 7.5, True, [1], {"v": 1}])
+def test_governance_state_ignores_a_malformed_config_version(bad: Any) -> None:
+    state = GovernanceState()
+    state.update_from_heartbeat(heartbeat(config_version=3))
+    beat = heartbeat()
+    beat["configVersion"] = bad
+    state.update_from_heartbeat(beat)
+    assert state.config_version == 3
+
+
+def test_flush_surfaces_config_version_and_a_change_between_heartbeats() -> None:
+    http = FakeHTTP(
+        [
+            {"accepted": 0, "failed": [], "heartbeat": heartbeat(config_version=4)},
+            {"accepted": 0, "failed": [], "heartbeat": heartbeat(config_version=4)},
+            {"accepted": 0, "failed": [], "heartbeat": heartbeat(config_version=5)},
+        ]
+    )
+    exporter = TelemetryExporter(http, FakeSessionManager(), heartbeat_interval=0.0)
+    exporter.flush_now()
+    first = exporter.state.config_version
+    exporter.flush_now()
+    unchanged = exporter.state.config_version
+    exporter.flush_now()
+    changed = exporter.state.config_version
+    assert (first, unchanged, changed) == (4, 4, 5)
+    # A caller that cached something detects the change by inequality.
+    assert changed != first and unchanged == first
 
 
 # ---------------------------------------------------------------------------

@@ -41,6 +41,7 @@ def _mock_session_and_heartbeat(lifecycle: str = "active") -> None:
                         "emergencyStop": False,
                         "telemetryMode": "advisory",
                         "telemetryStalenessMinutes": 30,
+                        "configVersion": 12,
                         "serverTime": "2026-09-18T00:00:00Z",
                     },
                 }
@@ -59,6 +60,7 @@ def test_cmd_status_prints_live_state(
     assert cli.cmd_status(_args(identity.display_name)) == 0
     out = capsys.readouterr().out
     assert "lifecycle_status:    suspended" in out
+    assert "config_version:      12" in out
     assert "suspended (locally): True" in out
 
 

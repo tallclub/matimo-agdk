@@ -31,6 +31,7 @@ from ._compat import sdk_requires_httpx2
 from ._outage import OutageGuard, degraded_attributes
 from ._retry_transport import AsyncSessionRetryTransport, SessionRetryTransport
 from .config import GatewayConfig
+from .control_stream import AsyncControlStreamConsumer, ControlStreamConsumer
 from .exceptions import GatewayError, ToolDenied
 from .identity import IdentityCredentials, JWSSigner, credentials_paths, save_credentials
 from .session import SESSION_TOKEN_HEADER, AsyncSessionManager, SessionManager
@@ -64,6 +65,9 @@ def current_run_id() -> str | None:
 
 
 REGISTER_PATH = "/identities"
+# QUALITY-REVIEW item 11 (2026-09-22, UAF-side) -- a cheap, side-effect-free
+# status probe. See Governor.check_health()/AsyncGovernor.check_health().
+HEALTH_PATH = "/health"
 
 
 _HTTPX2_HINT = (
@@ -241,6 +245,7 @@ class Governor:
         self._session: SessionManager | None = None
         self._tools: ToolGovernor | None = None
         self._telemetry: TelemetryExporter | None = None
+        self._control_stream: ControlStreamConsumer | None = None
         self._started = False
         self._on_suspend_callback: Callable[[GovernanceState], None] | None = None
         # True once this process wrote (or found) a credentials file for the
@@ -340,6 +345,34 @@ class Governor:
             self._persisted = True
         return identity
 
+    def check_health(self) -> dict[str, Any]:
+        """GET /v1/health -- QUALITY-REVIEW item 11 (2026-09-22). A cheap,
+        side-effect-free status probe: confirms the org API key is valid and
+        the tenant's Matimo Enterprise license is active, without registering
+        an identity or opening a session. Unlike every other Governor method,
+        this needs no identity at all -- only config.api_key -- so it can run
+        before register() and does not require Governor.from_env() to have
+        found local credentials.
+
+        Before this endpoint existed, the only way to answer "is the license
+        active" was a real POST /v1/identities call (see this SDK's own
+        scripts/live_check.py, which used to register a throwaway identity
+        purely to answer that question -- registered identities are never
+        deleted server-side, see docs/SERVER-CONTRACT.md section 10, so that
+        left an inert row behind on every run).
+
+        Raises GatewayError (status_code=403, code='license_required') when
+        the license is missing, expired or disabled -- that 403 IS the
+        "license inactive" signal; a 200 response's `license.active` is
+        always True (the server already rejected an inactive one before
+        returning). See docs/SERVER-CONTRACT.md section 0 for the response
+        shape: `{status, license: {active, mode, emergencyStopActive},
+        serverTime}`.
+        """
+        _require_api_key(self.config)
+        resp = self._http.request("GET", HEALTH_PATH, sign=False)
+        return dict(resp.data)
+
     def rotate_key(self) -> IdentityCredentials:
         """POST /v1/identities/:agentId/rotate-key. The new private key is
         returned exactly once; persisted immediately. Every subsequent
@@ -392,6 +425,19 @@ class Governor:
             heartbeat_resolver=self.config.resolved_heartbeat_interval,
             on_suspend=self._on_suspend_callback,
         )
+        # The push channel starts BEFORE the exporter thread on purpose:
+        # Thread.start() yields the GIL, and starting it after would let the
+        # exporter's first heartbeat run to completion before start() returns,
+        # i.e. before a caller's `governor.on_suspend(cb)` on the next line.
+        if self.config.control_stream_enabled and self._session is not None:
+            self._control_stream = ControlStreamConsumer(
+                self._http,
+                self._session,
+                self._telemetry,
+                lambda: self._identity.identity_id if self._identity is not None else None,
+                read_timeout=self.config.control_stream_read_timeout,
+            )
+            self._control_stream.start()
         self._telemetry.start()
         self._started = True
         return self
@@ -400,6 +446,9 @@ class Governor:
         """Flushes telemetry and stops the exporter. The HTTP client stays
         open so start() can be called again; call close() (or use the
         governor as a context manager) to release it."""
+        if self._control_stream is not None:
+            self._control_stream.stop()
+            self._control_stream = None
         if self._telemetry is not None:
             self._telemetry.stop()
         self._started = False
@@ -425,6 +474,15 @@ class Governor:
 
     def is_suspended(self) -> bool:
         return self.state.is_suspended
+
+    @property
+    def control_stream_status(self) -> str:
+        """'disabled' (turned off or not started), or the push channel's state:
+        'connecting', 'connected', 'backoff' or 'unsupported' (the server has no
+        stream; polling only). Informational: polling works in every state."""
+        if self._control_stream is None:
+            return "disabled"
+        return self._control_stream.status
 
     def raise_if_suspended(self) -> None:
         if self._telemetry is not None:
@@ -802,6 +860,7 @@ class AsyncGovernor:
         self._session: AsyncSessionManager | None = None
         self._tools: AsyncToolGovernor | None = None
         self._telemetry: AsyncTelemetryExporter | None = None
+        self._control_stream: AsyncControlStreamConsumer | None = None
         self._started = False
         self._on_suspend_callback: Callable[[GovernanceState], None] | None = None
         # True once this process wrote (or found) a credentials file for the
@@ -888,6 +947,12 @@ class AsyncGovernor:
             self._persisted = True
         return identity
 
+    async def check_health(self) -> dict[str, Any]:
+        """Async twin of Governor.check_health()."""
+        _require_api_key(self.config)
+        resp = await self._http.request("GET", HEALTH_PATH, sign=False)
+        return dict(resp.data)
+
     async def rotate_key(self) -> IdentityCredentials:
         if self._identity is None:
             raise GatewayError("cannot rotate a key before an identity is registered or loaded")
@@ -934,10 +999,22 @@ class AsyncGovernor:
             on_suspend=self._on_suspend_callback,
         )
         await self._telemetry.start()
+        if self.config.control_stream_enabled and self._session is not None:
+            self._control_stream = AsyncControlStreamConsumer(
+                self._http,
+                self._session,
+                self._telemetry,
+                lambda: self._identity.identity_id if self._identity is not None else None,
+                read_timeout=self.config.control_stream_read_timeout,
+            )
+            await self._control_stream.start()
         self._started = True
         return self
 
     async def stop(self) -> None:
+        if self._control_stream is not None:
+            await self._control_stream.stop()
+            self._control_stream = None
         if self._telemetry is not None:
             await self._telemetry.stop()
         self._started = False
@@ -961,6 +1038,13 @@ class AsyncGovernor:
 
     def is_suspended(self) -> bool:
         return self.state.is_suspended
+
+    @property
+    def control_stream_status(self) -> str:
+        """Async twin of Governor.control_stream_status."""
+        if self._control_stream is None:
+            return "disabled"
+        return self._control_stream.status
 
     def raise_if_suspended(self) -> None:
         if self._telemetry is not None:

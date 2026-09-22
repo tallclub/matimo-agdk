@@ -5,11 +5,16 @@ envelope) and AGDK-SERVER-HEARTBEAT-REPORT.md (the heartbeat now riding
 every POST /v1/telemetry/batch response, including a pure {"events": []}
 poll, which never touches last_telemetry_at server-side).
 
-Rapid suspend is POLLED, not pushed (docs/SERVER-CONTRACT.md section 10:
-"No push-based kill switch"). Name and document this honestly: a suspend
-or emergency stop takes up to one heartbeat interval to be observed
-locally, even though the *next Gateway call* is denied immediately
-server-side regardless of this local state.
+Rapid suspend has two channels. The POLLED heartbeat above is the guarantee: a
+suspend or emergency stop is observed within one heartbeat interval, and the
+*next Gateway call* is denied immediately server-side regardless of this local
+state. On top of that, matimo_agdk.control_stream keeps a Server-Sent Events
+connection to GET /v1/control/stream and pushes suspend, revoke and emergency
+stop to `GovernanceState` within about a second. A push is only ever a HINT
+(see GovernanceState.tighten_from_hint): it can tighten local state at once but
+never relaxes it, and every push also triggers an immediate heartbeat poll that
+sets the authoritative state. Polling behaviour is unchanged when the stream is
+off, unsupported by the server, or down.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import asyncio
 import atexit
 import logging
 import queue
+import random
 import threading
 import time
 from collections.abc import Callable
@@ -60,6 +66,14 @@ def _is_permanent_rejection(exc: GatewayError) -> bool:
 # GovernanceState
 # ---------------------------------------------------------------------------
 
+# Higher is more restrictive. Anything not listed (an unknown status, "active")
+# counts as 0, so a hint can only ever move the state upward.
+_LIFECYCLE_SEVERITY = {"active": 0, "unknown": 0, "suspended": 1, "revoked": 2}
+
+# A tenant-wide push (emergency stop) reaches every agent of the tenant at once;
+# this spreads the confirming heartbeat polls those pushes trigger.
+_TENANT_WIDE_REFRESH_JITTER_SECONDS = 1.0
+
 
 @dataclass
 class GovernanceState:
@@ -75,6 +89,16 @@ class GovernanceState:
     telemetry_mode: str = "advisory"
     telemetry_staleness_minutes: float = 30.0
     server_time: str | None = None
+    # Gateway's per-tenant configuration version, from the heartbeat's
+    # `configVersion`. It changes whenever a policy, guardrail (or its binding), a
+    # tool category, the tenant license or this identity's governance fields are
+    # written. Opaque: compare it for inequality with the value you saw last, do
+    # not do arithmetic on it. None until a heartbeat has carried one, and it keeps
+    # its last value when a heartbeat carries none (an older Gateway, or a
+    # server-side read that failed and sent `null`), so "no information" is never
+    # mistaken for a change. The SDK caches no decisions or policy itself, so it
+    # only surfaces this; use it to decide when to re-check anything you cached.
+    config_version: int | None = None
     last_polled_monotonic: float = field(default_factory=time.monotonic)
     # Unlike last_polled_monotonic (which starts at "now"), this is None until a
     # heartbeat has really arrived, so "never heard from Gateway" is distinguishable
@@ -89,12 +113,53 @@ class GovernanceState:
             "telemetryStalenessMinutes", self.telemetry_staleness_minutes
         )
         self.server_time = heartbeat.get("serverTime", self.server_time)
+        version = heartbeat.get("configVersion")
+        if isinstance(version, int) and not isinstance(version, bool):
+            self.config_version = version
         self.last_polled_monotonic = time.monotonic()
         self.last_heartbeat_monotonic = self.last_polled_monotonic
 
     @property
     def is_suspended(self) -> bool:
         return self.emergency_stop or self.lifecycle_status in ("suspended", "revoked")
+
+    def tighten_from_hint(self, name: str, data: Any, identity_id: str | None) -> bool:
+        """Applies a control-stream event to local state, in the TIGHTENING
+        direction only, and returns True when something changed.
+
+        Why an event cannot grant more access than polling would: pub/sub is
+        at-most-once and may arrive late or out of order, so an event is never
+        trusted to *relax* anything. `suspended` and `revoked` (and emergency
+        stop on) take effect immediately, because acting on a wrong tighten is
+        cheap and self-correcting (the heartbeat the caller triggers next sets
+        the real state), while acting on a wrong relax would let a suspended
+        agent run. Restore, emergency stop off and an "active" snapshot change
+        nothing here; the caller re-reads the heartbeat for those. An event
+        about another identity is ignored, and so is any malformed one.
+        Never touches `config_version`, `server_time` or the heartbeat clocks:
+        those belong to the heartbeat alone.
+        """
+        if not isinstance(data, dict):
+            return False
+        identity_scoped = name in ("lifecycle", "ready")
+        if identity_scoped:
+            if identity_id is None or data.get("identityId") != identity_id:
+                return False
+        elif name != "emergency_stop":
+            return False
+        tightened = False
+        if identity_scoped:
+            status = data.get("lifecycleStatus")
+            if status in ("suspended", "revoked") and _LIFECYCLE_SEVERITY[status] > (
+                _LIFECYCLE_SEVERITY.get(self.lifecycle_status, 0)
+            ):
+                self.lifecycle_status = status
+                tightened = True
+        if name in ("emergency_stop", "ready"):
+            if data.get("emergencyStop") is True and not self.emergency_stop:
+                self.emergency_stop = True
+                tightened = True
+        return tightened
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +375,10 @@ class TelemetryExporter:
         self.last_error: GatewayError | None = None
         self._first_tick = True
         self._stop_event = threading.Event()
+        # Wakes the loop early, for a stop or a requested heartbeat refresh.
+        self._wake = threading.Event()
+        self._refresh_requested = threading.Event()
+        self._refresh_jitter = False
         self._thread: threading.Thread | None = None
         self._last_flush_monotonic = time.monotonic()
         self._suspend_notified = False
@@ -319,6 +388,7 @@ class TelemetryExporter:
         if self._thread is not None:
             return
         self._stop_event.clear()
+        self._wake.clear()
         self._thread = threading.Thread(target=self._run, name="matimo-agdk-telemetry", daemon=True)
         self._thread.start()
         atexit.register(self.stop)
@@ -330,6 +400,7 @@ class TelemetryExporter:
         # its HTTP client) for the life of the process and fire again at exit.
         atexit.unregister(self.stop)
         self._stop_event.set()
+        self._wake.set()
         self._thread.join(timeout=timeout)
         self._thread = None
         self._flush_all()
@@ -337,6 +408,30 @@ class TelemetryExporter:
 
     def set_on_suspend(self, callback: Callable[[GovernanceState], None] | None) -> None:
         self._on_suspend = callback
+        # A callback registered after the agent was already found suspended
+        # (start() then on_suspend() races the first heartbeat or a push) still
+        # fires once, instead of being silently skipped.
+        if callback is not None:
+            self._maybe_notify_suspend()
+
+    def apply_control_hint(self, name: str, data: Any, identity_id: str | None) -> bool:
+        """Tightens local state from a control-stream event (see
+        GovernanceState.tighten_from_hint) and fires `on_suspend` at once if
+        that made the agent suspended. Called from the stream's thread."""
+        with self._state_lock:
+            tightened = self.state.tighten_from_hint(name, data, identity_id)
+        if tightened:
+            self._maybe_notify_suspend()
+        return tightened
+
+    def request_refresh(self, *, jitter: bool = False) -> None:
+        """Asks the exporter thread to poll the heartbeat now instead of at its
+        next interval. Safe from any thread and never blocks. `jitter` delays
+        the poll by up to a second, for tenant-wide events every agent hears."""
+        if jitter:
+            self._refresh_jitter = True
+        self._refresh_requested.set()
+        self._wake.set()
 
     def _raise_pending(self) -> None:
         if self._fail_open or self.last_error is None:
@@ -377,17 +472,28 @@ class TelemetryExporter:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             backlog = False
+            # Cleared BEFORE the flush: a refresh requested while this iteration
+            # is in flight survives to the next one instead of being lost.
+            refresh = self._refresh_requested.is_set()
+            if refresh:
+                self._refresh_requested.clear()
+                if self._refresh_jitter:
+                    self._refresh_jitter = False
+                    self._stop_event.wait(random.uniform(0.0, _TENANT_WIDE_REFRESH_JITTER_SECONDS))
+                    if self._stop_event.is_set():
+                        break
             try:
                 # The first tick is a forced heartbeat so the server-reported
                 # staleness window sizes the interval before the first idle wait.
-                ok = self._flush(force=self._first_tick)
+                ok = self._flush(force=self._first_tick or refresh)
                 backlog = ok and not self._queue.empty()
             except Exception:  # noqa: BLE001 -- the exporter thread must never die
                 _log.exception("telemetry exporter iteration failed; will retry")
             self._first_tick = False
             # A backlog is drained back to back; only an idle queue waits.
             if not backlog:
-                self._stop_event.wait(min(self._flush_interval, self._heartbeat_interval))
+                self._wake.wait(min(self._flush_interval, self._heartbeat_interval))
+                self._wake.clear()
 
     def _drain(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -473,15 +579,18 @@ class TelemetryExporter:
                 return
             if self._suspend_notified:
                 return
-            self._suspend_notified = True
             callback = self._on_suspend
+            if callback is None:
+                # Nobody to tell yet: stay un-notified so a callback registered
+                # later (set_on_suspend) still fires for this suspension.
+                return
+            self._suspend_notified = True
         # Outside the lock, and isolated: a user callback must not be able to
         # deadlock or kill the exporter thread.
-        if callback:
-            try:
-                callback(self.state)
-            except Exception:  # noqa: BLE001
-                _log.exception("on_suspend callback raised")
+        try:
+            callback(self.state)
+        except Exception:  # noqa: BLE001
+            _log.exception("on_suspend callback raised")
 
     def is_suspended(self) -> bool:
         return self.state.is_suspended
@@ -530,6 +639,10 @@ class AsyncTelemetryExporter:
         self._first_tick = True
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        # Wakes the loop early, for a stop or a requested heartbeat refresh.
+        self._wake: asyncio.Event | None = None
+        self._refresh_requested = False
+        self._refresh_jitter = False
         self._last_flush_monotonic = time.monotonic()
         self._suspend_notified = False
 
@@ -538,20 +651,26 @@ class AsyncTelemetryExporter:
             self._queue = asyncio.Queue(maxsize=self._queue_max)
         if self._stop_event is None:
             self._stop_event = asyncio.Event()
+        if self._wake is None:
+            self._wake = asyncio.Event()
 
     async def start(self) -> None:
         self._ensure_bound()
         if self._task is not None:
             return
         assert self._stop_event is not None
+        assert self._wake is not None
         self._stop_event.clear()
+        self._wake.clear()
         self._task = asyncio.ensure_future(self._run())
 
     async def stop(self, *, timeout: float = 5.0) -> None:
         if self._task is None:
             return
         assert self._stop_event is not None
+        assert self._wake is not None
         self._stop_event.set()
+        self._wake.set()
         try:
             await asyncio.wait_for(self._task, timeout=timeout)
         except TimeoutError:
@@ -562,6 +681,26 @@ class AsyncTelemetryExporter:
 
     def set_on_suspend(self, callback: Callable[[GovernanceState], None] | None) -> None:
         self._on_suspend = callback
+        if callback is not None:
+            self._maybe_notify_suspend()
+
+    def apply_control_hint(self, name: str, data: Any, identity_id: str | None) -> bool:
+        """Async twin of TelemetryExporter.apply_control_hint(). Runs on the
+        event loop, so it needs no lock."""
+        tightened = self.state.tighten_from_hint(name, data, identity_id)
+        if tightened:
+            self._maybe_notify_suspend()
+        return tightened
+
+    def request_refresh(self, *, jitter: bool = False) -> None:
+        """Async twin of TelemetryExporter.request_refresh(). Call it from the
+        exporter's own event loop (the control-stream task does)."""
+        self._ensure_bound()
+        assert self._wake is not None
+        if jitter:
+            self._refresh_jitter = True
+        self._refresh_requested = True
+        self._wake.set()
 
     def _raise_pending(self) -> None:
         if self._fail_open or self.last_error is None:
@@ -601,10 +740,20 @@ class AsyncTelemetryExporter:
     async def _run(self) -> None:
         assert self._stop_event is not None
         assert self._queue is not None
+        assert self._wake is not None
         while not self._stop_event.is_set():
             backlog = False
+            # Cleared BEFORE the flush, as in the sync exporter.
+            refresh = self._refresh_requested
+            if refresh:
+                self._refresh_requested = False
+                if self._refresh_jitter:
+                    self._refresh_jitter = False
+                    await asyncio.sleep(random.uniform(0.0, _TENANT_WIDE_REFRESH_JITTER_SECONDS))
+                    if self._stop_event.is_set():
+                        break
             try:
-                ok = await self._flush(force=self._first_tick)
+                ok = await self._flush(force=self._first_tick or refresh)
                 backlog = ok and not self._queue.empty()
             except Exception:  # noqa: BLE001 -- the exporter task must never die
                 _log.exception("telemetry exporter iteration failed; will retry")
@@ -613,11 +762,12 @@ class AsyncTelemetryExporter:
                 continue
             try:
                 await asyncio.wait_for(
-                    self._stop_event.wait(),
+                    self._wake.wait(),
                     timeout=min(self._flush_interval, self._heartbeat_interval),
                 )
             except TimeoutError:
                 pass
+            self._wake.clear()
 
     def _drain(self) -> list[dict[str, Any]]:
         assert self._queue is not None
@@ -690,12 +840,13 @@ class AsyncTelemetryExporter:
             return
         if self._suspend_notified:
             return
+        if self._on_suspend is None:
+            return  # stay un-notified so a later set_on_suspend() still fires
         self._suspend_notified = True
-        if self._on_suspend:
-            try:
-                self._on_suspend(self.state)
-            except Exception:  # noqa: BLE001 -- a user callback must not kill the exporter
-                _log.exception("on_suspend callback raised")
+        try:
+            self._on_suspend(self.state)
+        except Exception:  # noqa: BLE001 -- a user callback must not kill the exporter
+            _log.exception("on_suspend callback raised")
 
     def is_suspended(self) -> bool:
         return self.state.is_suspended

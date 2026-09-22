@@ -74,6 +74,23 @@ async def test_heartbeat_updates_state_and_raise_if_suspended() -> None:
         exporter.raise_if_suspended()
 
 
+async def test_heartbeat_surfaces_config_version_and_keeps_it_when_absent() -> None:
+    http = AsyncFakeHTTP(
+        [
+            {"accepted": 0, "failed": [], "heartbeat": heartbeat(config_version=11)},
+            {"accepted": 0, "failed": [], "heartbeat": heartbeat()},
+            {"accepted": 0, "failed": [], "heartbeat": heartbeat(config_version=12)},
+        ]
+    )
+    exporter = AsyncTelemetryExporter(http, AsyncFakeSessionManager(), heartbeat_interval=0.0)
+    await exporter.flush_now()
+    assert exporter.state.config_version == 11
+    await exporter.flush_now()
+    assert exporter.state.config_version == 11  # no field: unchanged, not reset
+    await exporter.flush_now()
+    assert exporter.state.config_version == 12
+
+
 async def test_fail_open_requeues_events_on_gateway_error() -> None:
     http = AsyncFakeHTTP([GatewayError("boom")])
     exporter = AsyncTelemetryExporter(http, AsyncFakeSessionManager(), heartbeat_interval=9999)

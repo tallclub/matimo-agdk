@@ -6,6 +6,72 @@ All notable changes to this project are documented in this file.
 
 Initial core SDK build. Not yet published to PyPI.
 
+### Fixed (2026-09-22, tool checks now carry X-Matimo-Run-Id)
+
+- **`ToolGovernor`/`AsyncToolGovernor`** (`matimo_agdk/tools.py`) now attach the
+  `X-Matimo-Run-Id` header to `POST /v1/tools/check`, `/tools/check/status` and
+  `/tools/result` whenever a run is active (`governor.run()` or
+  `bind_run_id()`) , the same header the LLM-call path has always sent, just
+  never wired into the tool-check client. A tool-check decision previously had
+  no way to be exactly correlated to the run that triggered it in the Gateway
+  Observability Hub; the server side of this fix (accepting and using the
+  header on `/v1/tools/check`) shipped separately in Matimo Gateway. The header
+  is optional, outside the signed JWS body, and simply omitted (never sent
+  empty) when no run is active , fully backward compatible with an older
+  Gateway.
+- `set_category()` (tenant-wide, unsigned, no identity header either) is
+  unaffected , it never calls `_headers()`.
+- New tests in `tests/test_tools.py` covering `check()`/`status()`/
+  `report_result()` with and without an active run, for both the sync and
+  async governors, plus a regression guard that `set_category()` never gains
+  the header.
+
+### Added (2026-09-21, control stream push channel , QUALITY-REVIEW item 8)
+
+- **`matimo_agdk.control_stream`** , a background thread (`ControlStreamConsumer`)
+  or asyncio task (`AsyncControlStreamConsumer`) per `Governor`/`AsyncGovernor`
+  that keeps `GET /v1/control/stream` (Server-Sent Events, docs/SERVER-CONTRACT.md
+  §7.3) open and typically delivers a suspend, restore, revoke or emergency-stop
+  change to `GovernanceState` within about a second, instead of waiting for the
+  next heartbeat poll (15 s to 5 min). Polling is unchanged and stays the
+  guarantee: a pushed event only ever tightens local state immediately
+  (`GovernanceState.tighten_from_hint()`); a relaxing event triggers an
+  immediate heartbeat poll rather than being trusted directly, so a forged or
+  late event can at worst pause the agent briefly, never grant it more access.
+- On by default. Turn it off with `GatewayConfig(control_stream_enabled=False)`
+  or `MATIMO_CONTROL_STREAM=0`; nothing about polling changes either way, and an
+  older Gateway with no route degrades to the same effect automatically
+  (detected from a 404/405/501, logged once, retried rarely).
+- New `Governor`/`AsyncGovernor` property: `control_stream_status` ,
+  `"connecting"` | `"connected"` | `"backoff"` | `"unsupported"` | `"disabled"`.
+- `GatewayHTTP`/`AsyncGatewayHTTP` gained `stream_get()` (a one-attempt,
+  no-retry streaming GET; the consumer owns reconnection) and
+  `TelemetryExporter`/`AsyncTelemetryExporter` gained `apply_control_hint()`
+  and `request_refresh(jitter=)`, plus an interruptible wait so a requested
+  refresh does not have to sit behind the existing poll interval.
+- `on_suspend(callback)` now fires once if the agent was already found
+  suspended before the callback was registered (a real gap this closed: a
+  callback registered right after `start()` could previously miss a
+  suspension the very first heartbeat or push already observed).
+- New module `tests/test_control_stream.py` (46 tests, against a real local
+  `http.server`-based SSE server) plus new coverage in `tests/test_telemetry.py`,
+  `tests/test_telemetry_async.py` and `tests/test_hardening.py`.
+- Two new permanent `scripts/live_check.py` scenarios: the push channel end to
+  end, and its flag-off negative control.
+- Docs: `docs/SERVER-CONTRACT.md` §7.3 (new), `docs/USER-MANUAL.md` ("Rapid
+  suspend", configuration reference, `Governor` reference table), this file.
+
+### Added (2026-09-21, heartbeat config version)
+
+- **`GovernanceState.config_version`** (`int | None`), from the heartbeat's new
+  `configVersion` (BUILD-PLAN F26): a per-tenant counter Gateway bumps whenever a
+  policy, guardrail or binding, tool category, license field or identity governance
+  field is written. `None` until a heartbeat carries one, and it keeps its last value
+  when a heartbeat carries none or `null` (older Gateway, or a failed server read),
+  so "no information" is never mistaken for a change. Malformed values (strings,
+  floats, booleans) are ignored. `matimo-agdk status` prints it. The SDK caches no
+  decisions, so it only surfaces the value; compare it for inequality, not order.
+
 ### Added and changed (2026-09-20, tool-check outage behaviour and tool spans)
 
 Tool checks during a Gateway outage (BUILD-PLAN D19, TRD section 4.1):

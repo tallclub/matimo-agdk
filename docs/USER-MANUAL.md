@@ -331,7 +331,7 @@ Details and caveats for each framework are in Part 12.
 | HTTP 400 `no_default_connection` | LLM call without `model=` and the tenant has no default model. | Always pass `model=`. |
 | HTTP 403 `model_not_allowed` | The model is not set up for the tenant or not allowed for this agent. | Use a model your admin configured. |
 | HTTP 502 `upstream_error` | Every model provider target failed. | The tenant's provider key is wrong or the provider is down. |
-| Response with `finish_reason: "content_filter"` | A guardrail blocked the prompt or the answer. | This is HTTP 200. The content is the guardrail's configured message. |
+| Response with `finish_reason: "content_filter"` (OpenAI shape), or an Anthropic-shape response whose `matimo.blocked` is `true` | A guardrail blocked the prompt or the answer. | This is HTTP 200. The content is the guardrail's configured message. On the Anthropic shape `stop_reason` is a normal `end_turn`, and `matimo` is a Matimo extension field, not part of Anthropic's API. |
 
 ---
 
@@ -396,10 +396,11 @@ Precedence, highest first: keyword arguments to `Governor(...)` or `Governor.fro
 | `MATIMO_PRIVATE_KEY` or `MATIMO_PRIVATE_KEY_FILE` | Private key PEM inline or by path | from file |
 | `MATIMO_TOOL_CHECK_FAILURE_MODE` | `fail_closed` or `fail_open_bounded` (see "When Gateway is down") | `fail_closed` |
 | `MATIMO_FAIL_OPEN_MAX_STALE_SECONDS` | How stale `fail_open_bounded` may be. Larger than 300 is rejected. | `300` |
+| `MATIMO_CONTROL_STREAM` | `0`/`false`/`off` disables the rapid-suspend push channel; anything else (or unset) leaves it on | on |
 
 You normally never set `MATIMO_TENANT_ID` yourself. It is saved in the credentials file at registration. It is only needed when you skip that file and supply the whole identity through environment variables.
 
-`GatewayConfig` fields you may set in code: `connect_timeout` (10 s), `read_timeout` (30 s), `telemetry_flush_interval` (5 s), `telemetry_batch_size` (50), `telemetry_queue_max` (2000), `heartbeat_interval` (derived from the server's staleness window, clamped to 15 s to 5 min), `fail_open_telemetry` (True: a reporting outage never blocks the agent), `signing_enabled` (True), `credentials_dir`, `tool_check_failure_mode` (`"fail_closed"`), `fail_open_max_stale_seconds` (300, the maximum), `tool_check_breaker_threshold` (3), `tool_check_breaker_cooldown` (30 s), `capture_tool_results` (False).
+`GatewayConfig` fields you may set in code: `connect_timeout` (10 s), `read_timeout` (30 s), `telemetry_flush_interval` (5 s), `telemetry_batch_size` (50), `telemetry_queue_max` (2000), `heartbeat_interval` (derived from the server's staleness window, clamped to 15 s to 5 min), `fail_open_telemetry` (True: a reporting outage never blocks the agent), `signing_enabled` (True), `credentials_dir`, `tool_check_failure_mode` (`"fail_closed"`), `fail_open_max_stale_seconds` (300, the maximum), `tool_check_breaker_threshold` (3), `tool_check_breaker_cooldown` (30 s), `capture_tool_results` (False), `control_stream_enabled` (True), `control_stream_read_timeout` (45 s , how long the push connection may sit silent before it is treated as dead and reconnected; must exceed the server's 15 s keepalive).
 
 For a container, mount nothing: set `MATIMO_IDENTITY_TOKEN`, `MATIMO_IDENTITY_ID`, `MATIMO_TENANT_ID` and `MATIMO_PRIVATE_KEY` from your secret store.
 
@@ -423,18 +424,45 @@ Every span an adapter or `guard()` records carries the tool's name, arguments (r
 
 ### Telemetry and heartbeat
 
-Spans are queued and flushed in batches to `POST /v1/telemetry/batch` every `telemetry_flush_interval` seconds. Every response carries a heartbeat: lifecycle status, emergency-stop flag, telemetry mode, staleness window, server time. An empty batch is a pure heartbeat and is sent even when the agent is idle.
+Spans are queued and flushed in batches to `POST /v1/telemetry/batch` every `telemetry_flush_interval` seconds. Every response carries a heartbeat: lifecycle status, emergency-stop flag, telemetry mode, staleness window, config version, server time. An empty batch is a pure heartbeat and is sent even when the agent is idle.
 
 Telemetry is the only signal Workbench has into tool execution it does not run. A tenant may set telemetry mode to `deny`: an agent whose last telemetry is older than the staleness window is refused at Gateway with `policy_denied` reason `telemetry_stale`. The fix is always the same: keep the exporter running (`start()` before work, `stop()` after).
 
 ### Rapid suspend
 
-An admin can suspend or revoke an identity, or trip an org-wide emergency stop. Two things happen on two timescales:
+An admin can suspend or revoke an identity, or trip an org-wide emergency stop. Three things happen, roughly in this order:
 
 - The next call Gateway receives from that agent is denied immediately, server-side, from a fresh database read.
-- `governor.state`, `is_suspended()`, `raise_if_suspended()` and `on_suspend(callback)` reflect the last heartbeat. They can lag by up to one heartbeat interval. A loop that never calls Gateway and never checks state could keep running locally for that long.
+- A background push connection (`GET /v1/control/stream`, on by default) typically delivers the change to `governor.state` within about a second.
+- If that connection is unavailable, `governor.state` still catches up at the next heartbeat, which can lag by up to `heartbeat_interval` (15 s to 5 min).
 
-Call `raise_if_suspended()` at the top of long loops, or register `on_suspend` to cancel work. There is no push channel in this version.
+`governor.state`, `is_suspended()`, `raise_if_suspended()` and `on_suspend(callback)` all reflect
+whichever of those arrived most recently. Call `raise_if_suspended()` at the top of long loops, or
+register `on_suspend` to cancel work as soon as either signal lands.
+
+Check `governor.control_stream_status` if you need to know which path is active:
+`"connected"` (the push channel is up), `"connecting"`, `"backoff"` (a transient failure,
+retrying), `"unsupported"` (this Gateway predates the route, or refuses it , you are on polling
+only, and that is not an error), or `"disabled"` (turned off, or the governor has not been
+started). Turn the push channel off with `GatewayConfig(control_stream_enabled=False)` or the
+`MATIMO_CONTROL_STREAM=0` environment variable; polling is unaffected either way, and this is a
+deliberate design choice, not a workaround , see "Why a push can only tighten" below.
+
+**Why a push can only tighten.** A pushed suspend/revoke/emergency-stop-on event updates
+`governor.state` immediately. A pushed restore or emergency-stop-off event does **not** , it
+only triggers an extra heartbeat poll right away, and that poll is what actually relaxes state.
+This means a forged, replayed, or out-of-order push can, at worst, make your agent pause for a
+moment until the next poll corrects it; it can never let a suspended agent keep running. You do
+not need to do anything to get this protection , it is how `tighten_from_hint()` works
+underneath `on_suspend`/`is_suspended()`.
+
+### Config version
+
+The heartbeat's `configVersion` is a per-tenant counter that changes whenever an admin edits a policy, a guardrail or its binding, a tool category, the license (emergency stop, telemetry mode) or an identity's governance settings. The SDK exposes the last value as `governor.state.config_version`, and `matimo-agdk status` prints it. The SDK itself caches no policy or decisions, so nothing is invalidated for you; the value is there for code of your own that caches something derived from Matimo's configuration.
+
+- Compare it for inequality with the value you saw last. Do not test for "greater than" and do not do arithmetic on it.
+- It is `None` until a heartbeat has carried one. A heartbeat with no `configVersion`, or an explicit `null` (an older Gateway, a Gateway whose database does not have the counter yet, or a failed read), leaves the last value in place: that is "no information", never a change.
+- It cannot announce a change that happens with no admin action, such as an access grant reaching its end date. It changes at heartbeat granularity, so it lags a change by up to one heartbeat interval.
 
 ### Tool checks and human approval
 
@@ -480,7 +508,8 @@ Only the category Gateway resolves is trusted. `set_tool_category(name, category
 | `openai_client_kwargs()` / `anthropic_client_kwargs()` | `base_url`, `api_key`, `default_headers` for those SDKs; also pass `http_client=governor.httpx_client()` (OpenAI) or `http_client=governor.anthropic_http_client()` (Anthropic) for a live, signed client |
 | `request_headers(body=None)` | Live headers (and signature over `body`) for a client you build yourself |
 | `bind_run_id(run_id)` | Attach a framework-owned run id without opening a span |
-| `state` / `is_suspended()` / `raise_if_suspended()` / `on_suspend(cb)` | Heartbeat-driven governance state |
+| `state` / `is_suspended()` / `raise_if_suspended()` / `on_suspend(cb)` | Governance state, updated by the push channel and the heartbeat poll; `state.config_version` is the last `configVersion` seen |
+| `control_stream_status` | `"connected"` \| `"connecting"` \| `"backoff"` \| `"unsupported"` \| `"disabled"` , informational, polling works in every state |
 | `rotate_key()` | New keypair; the old key stops verifying immediately |
 | `identity` | The bound `IdentityCredentials` |
 
@@ -555,7 +584,7 @@ Takes a callable, a list, or a dict, and returns the same shape with each callab
 
 ## 13. Verifying an installation end to end
 
-`scripts/live_check.py` in the repository runs 15 scenarios against a real Gateway: registration, doctor, heartbeat, telemetry masking, signature enforcement, a real signed completion, rapid suspend, tool checks in all four outcomes, the LangChain adapter, session expiry, key rotation, and the call log. It needs `MATIMO_API_KEY`, `MATIMO_TENANT_ID`, and a tenant-admin `MATIMO_ADMIN_TOKEN` from the same tenant, and optionally `MATIMO_GATEWAY_MODEL`. It never creates accounts, keys, licenses, or providers.
+`scripts/live_check.py` in the repository runs scenarios against a real Gateway: registration, doctor, heartbeat, telemetry masking, signature enforcement, a real signed completion, rapid suspend (polling only), the control-stream push channel (with a flag-off negative control), tool checks in all four outcomes, the LangChain adapter, session expiry, key rotation, and the call log. It needs `MATIMO_API_KEY`, `MATIMO_TENANT_ID`, and a tenant-admin `MATIMO_ADMIN_TOKEN` from the same tenant, and optionally `MATIMO_GATEWAY_MODEL`. It never creates accounts, keys, licenses, or providers.
 
 ```bash
 uv run --group dev python scripts/live_check.py
@@ -566,6 +595,6 @@ uv run --group dev python scripts/live_check.py --filter "tool check"
 
 - It does not hold or forward your LLM provider keys.
 - It does not execute tools; it decides and records.
-- It does not push a kill signal; suspension is enforced at Gateway and polled by the SDK.
+- Suspension is always enforced at Gateway on the next call, regardless of what the SDK locally believes. Locally, the SDK is usually told within about a second over a background push connection, and always finds out at the next heartbeat poll if that connection is down or the server does not support it.
 - It does not sign telemetry.
 - It does not support AutoGen 0.2, or multimodal message content parts through Gateway yet.

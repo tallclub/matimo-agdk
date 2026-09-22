@@ -78,6 +78,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"emergency_stop:      {state.emergency_stop}")
     print(f"telemetry_mode:      {state.telemetry_mode}")
     print(f"staleness_minutes:   {state.telemetry_staleness_minutes}")
+    print(f"config_version:      {state.config_version}")
     print(f"server_time:         {state.server_time}")
     print(f"suspended (locally): {state.is_suspended}")
     return 0

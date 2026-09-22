@@ -200,7 +200,18 @@ class ToolGovernor:
         self._external_framework = external_framework
 
     def _headers(self) -> dict[str, str]:
-        return {IDENTITY_TOKEN_HEADER: self._identity_token}
+        # Deferred import: governor.py imports ToolGovernor/AsyncToolGovernor
+        # (see tools.py's own module docstring context and _outage.py for the
+        # same pattern), so a top-of-file `from .governor import ...` here
+        # would be circular. RUN_ID_HEADER/current_run_id are already defined
+        # by the time this runs.
+        from .governor import RUN_ID_HEADER, current_run_id
+
+        headers = {IDENTITY_TOKEN_HEADER: self._identity_token}
+        run_id = current_run_id()
+        if run_id:
+            headers[RUN_ID_HEADER] = run_id
+        return headers
 
     def _sign_kwargs(self) -> dict[str, Any]:
         return dict(
@@ -406,7 +417,14 @@ class AsyncToolGovernor:
         self._external_framework = external_framework
 
     def _headers(self) -> dict[str, str]:
-        return {IDENTITY_TOKEN_HEADER: self._identity_token}
+        # See ToolGovernor._headers() -- same deferred-import circularity fix.
+        from .governor import RUN_ID_HEADER, current_run_id
+
+        headers = {IDENTITY_TOKEN_HEADER: self._identity_token}
+        run_id = current_run_id()
+        if run_id:
+            headers[RUN_ID_HEADER] = run_id
+        return headers
 
     def _sign_kwargs(self) -> dict[str, Any]:
         return dict(
