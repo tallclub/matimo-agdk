@@ -9,7 +9,8 @@ from pathlib import Path
 import httpx
 import respx
 
-from matimo_agdk import cli, identity as identity_mod
+from matimo_agdk import cli
+from matimo_agdk import identity as identity_mod
 from matimo_agdk.identity import IdentityCredentials, load_credentials, save_credentials
 
 from .conftest import BASE_URL, future_iso
@@ -19,11 +20,33 @@ def _args(name: str, **extra: object) -> argparse.Namespace:
     return argparse.Namespace(name=name, gateway_url=BASE_URL, api_key="org-key", **extra)
 
 
+def _mock_health(active: bool = True, mode: str = "shadow") -> None:
+    if active:
+        respx.get(f"{BASE_URL}/health").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "status": "ok",
+                        "license": {"active": True, "mode": mode, "emergencyStopActive": False},
+                        "serverTime": "2026-09-27T00:00:00Z",
+                    }
+                },
+            )
+        )
+    else:
+        respx.get(f"{BASE_URL}/health").mock(
+            return_value=httpx.Response(403, json={"error": "license_required"})
+        )
+
+
 def _mock_session_and_heartbeat(lifecycle: str = "active") -> None:
     respx.post(f"{BASE_URL}/sessions").mock(
         return_value=httpx.Response(
             201,
-            json={"data": {"sessionToken": "tok", "expiresAt": future_iso(3600), "identityId": "x"}},
+            json={
+                "data": {"sessionToken": "tok", "expiresAt": future_iso(3600), "identityId": "x"}
+            },
         )
     )
     respx.post(f"{BASE_URL}/telemetry/batch").mock(
@@ -38,6 +61,7 @@ def _mock_session_and_heartbeat(lifecycle: str = "active") -> None:
                         "emergencyStop": False,
                         "telemetryMode": "advisory",
                         "telemetryStalenessMinutes": 30,
+                        "configVersion": 12,
                         "serverTime": "2026-09-18T00:00:00Z",
                     },
                 }
@@ -56,6 +80,7 @@ def test_cmd_status_prints_live_state(
     assert cli.cmd_status(_args(identity.display_name)) == 0
     out = capsys.readouterr().out
     assert "lifecycle_status:    suspended" in out
+    assert "config_version:      12" in out
     assert "suspended (locally): True" in out
 
 
@@ -65,15 +90,35 @@ def test_cmd_doctor_passes_end_to_end(
 ) -> None:
     monkeypatch.setattr(identity_mod, "DEFAULT_CREDENTIALS_DIR", credentials_dir)
     save_credentials(identity, credentials_dir)
+    _mock_health()
     _mock_session_and_heartbeat()
     assert cli.cmd_doctor(_args(identity.display_name)) == 0
     out = capsys.readouterr().out
+    assert "[ok] Gateway reachable, license active (mode=shadow)" in out
     assert "[ok] session handshake succeeded" in out
     assert "doctor: all checks passed" in out
     assert identity.private_key_pem not in out
 
 
-def test_cmd_status_without_identity_fails_cleanly(credentials_dir: Path, monkeypatch, capsys) -> None:
+@respx.mock
+def test_cmd_doctor_fails_fast_on_bad_health_check(
+    identity: IdentityCredentials, credentials_dir: Path, monkeypatch, capsys
+) -> None:
+    """An invalid key or inactive license is caught by GET /v1/health before
+    the (identity-requiring) checks below it even run -- this is the whole
+    point of QUALITY-REVIEW item 11 existing."""
+    monkeypatch.setattr(identity_mod, "DEFAULT_CREDENTIALS_DIR", credentials_dir)
+    save_credentials(identity, credentials_dir)
+    _mock_health(active=False)
+    assert cli.cmd_doctor(_args(identity.display_name)) == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] GET /v1/health failed" in out
+    assert "identity loaded" not in out
+
+
+def test_cmd_status_without_identity_fails_cleanly(
+    credentials_dir: Path, monkeypatch, capsys
+) -> None:
     monkeypatch.setattr(identity_mod, "DEFAULT_CREDENTIALS_DIR", credentials_dir)
     assert cli.cmd_status(_args("nobody")) == 1
     assert "no identity found" in capsys.readouterr().err

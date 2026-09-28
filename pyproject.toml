@@ -9,16 +9,15 @@ description = "Matimo Agent Governance Development Kit: govern any agent in thre
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "roaiq Technologies" }]
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 keywords = ["agent", "governance", "llm", "gateway", "matimo", "agdk"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
@@ -37,7 +36,11 @@ langchain = [
     "langchain-anthropic>=1.7",
 ]
 google-adk = [
-    "google-adk[extensions]>=2.9",
+    # No `[extensions]` extra: gateway_model() talks to the real `openai` SDK
+    # directly (matimo_agdk/adapters/_adk_openai.py), not litellm, which is
+    # all `[extensions]` was pulled in for.
+    "google-adk>=2.9",
+    "openai>=2.54",
 ]
 crewai = ["crewai>=1.15"]
 autogen = [
@@ -68,6 +71,8 @@ dev = [
   "pytest>=8",
   "pytest-asyncio>=0.23",
   "respx>=0.21",
+  # tests/contract validates SDK requests against the OpenAPI 3.1 spec.
+  "jsonschema>=4.18",
   "ruff>=0.6",
   "mypy>=1.10",
   # scripts/live_check.py only -- direct SQL nudges/assertions against the
@@ -79,7 +84,7 @@ dev = [
 line-length = 100
 # ruff >= 0.16 formats Markdown code blocks; the docs are prose, not code.
 extend-exclude = ["docs", "*.md"]
-target-version = "py311"
+target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -93,10 +98,15 @@ ignore = ["B008"]
 "scripts/*.py" = ["E501"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
 ignore_missing_imports = true
 warn_unused_ignores = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = [
+    # The suite talks to http://testserver; the cleartext-credentials warning is
+    # covered by its own test, which asserts it explicitly.
+    "ignore:base_url .* is plain http:UserWarning",
+]

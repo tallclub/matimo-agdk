@@ -12,8 +12,9 @@ import argparse
 import sys
 from typing import Any
 
+from . import __version__
 from .config import DEFAULT_BASE_URL, GatewayConfig
-from .exceptions import GatewayError
+from .exceptions import GatewayError, SigningError
 from .governor import Governor
 from .identity import credentials_paths
 
@@ -41,6 +42,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             display_name=args.name,
             framework=args.framework,
             allowed_tool_categories=args.tool_category or None,
+            overwrite=args.force,
         )
     except GatewayError as exc:
         print(f"registration failed: {exc.message}", file=sys.stderr)
@@ -58,18 +60,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     config = _build_config(args)
     governor = Governor(config)
     if governor.identity is None:
-        print("error: no identity found. Run `matimo register` first.", file=sys.stderr)
+        print("error: no identity found. Run `matimo-agdk register` first.", file=sys.stderr)
         return 1
     try:
         governor.start()
-        assert governor._telemetry is not None  # noqa: SLF001 -- guaranteed by start()
-        governor._telemetry.flush_now()  # noqa: SLF001 -- CLI-internal, forces one heartbeat now
+        governor.flush()  # forces one heartbeat now
         state = governor.state
     except GatewayError as exc:
         print(f"status check failed: {exc.message}", file=sys.stderr)
         return 1
     finally:
-        governor.stop()
+        governor.close()
     print(
         f"identity:            {governor.identity.identity_id} ({governor.identity.display_name})"
     )
@@ -77,6 +78,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"emergency_stop:      {state.emergency_stop}")
     print(f"telemetry_mode:      {state.telemetry_mode}")
     print(f"staleness_minutes:   {state.telemetry_staleness_minutes}")
+    print(f"config_version:      {state.config_version}")
     print(f"server_time:         {state.server_time}")
     print(f"suspended (locally): {state.is_suspended}")
     return 0
@@ -86,7 +88,7 @@ def cmd_rotate_key(args: argparse.Namespace) -> int:
     config = _build_config(args)
     governor = Governor(config)
     if governor.identity is None:
-        print("error: no identity found. Run `matimo register` first.", file=sys.stderr)
+        print("error: no identity found. Run `matimo-agdk register` first.", file=sys.stderr)
         return 1
     try:
         identity = governor.rotate_key()
@@ -109,8 +111,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("  [ok] org API key present")
 
     governor = Governor(config)
+
+    # GET /v1/health (QUALITY-REVIEW item 11) needs only the org API key --
+    # no identity, no session -- so it can catch a bad key or an inactive
+    # Matimo Enterprise license before the identity check below even runs.
+    try:
+        health = governor.check_health()
+        license_info = health.get("license", {})
+        print(f"  [ok] Gateway reachable, license active (mode={license_info.get('mode')})")
+    except GatewayError as exc:
+        print(f"  [FAIL] GET /v1/health failed: {exc.message}")
+        return 1
+
     if governor.identity is None:
-        print("  [FAIL] no identity found -- run `matimo register` first")
+        print("  [FAIL] no identity found -- run `matimo-agdk register` first")
         return 1
     print(f"  [ok] identity loaded: {governor.identity.identity_id}")
 
@@ -124,15 +138,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     try:
         governor.start()
-        assert governor._telemetry is not None  # noqa: SLF001 -- guaranteed by start()
-        governor._telemetry.flush_now()  # noqa: SLF001
+        governor.flush()
         state = governor.state
         print(f"  [ok] telemetry heartbeat succeeded: lifecycle_status={state.lifecycle_status}")
     except GatewayError as exc:
         print(f"  [FAIL] telemetry heartbeat failed: {exc.message}")
         return 1
     finally:
-        governor.stop()
+        governor.close()
 
     print("doctor: all checks passed")
     return 0
@@ -142,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="matimo-agdk", description="Matimo Agent Governance Development Kit CLI"
     )
+    parser.add_argument("--version", action="version", version=f"matimo-agdk {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
@@ -162,6 +176,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_register.add_argument(
         "--tool-category", action="append", default=[], help="Allowed tool category (repeatable)"
+    )
+    p_register.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing local credentials for --name (destroys the old private key)",
     )
     p_register.set_defaults(func=cmd_register)
 
@@ -189,7 +208,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    sys.exit(args.func(args))
+    try:
+        code = args.func(args)
+    except GatewayError as exc:
+        print(f"error: {exc.message}", file=sys.stderr)
+        code = 1
+    except (SigningError, ValueError) as exc:
+        # SigningError: a malformed private key in the credentials file or env.
+        # ValueError (incl. pydantic.ValidationError): bad configuration values.
+        # A user running `doctor` wants the diagnosis, not a traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        code = 1
+    sys.exit(code)
 
 
 if __name__ == "__main__":

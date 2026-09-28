@@ -10,6 +10,7 @@ import respx
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import ToolException, tool
 
+from matimo_agdk.config import GatewayConfig
 from matimo_agdk.exceptions import AgentSuspendedLocally
 from matimo_agdk.identity import IdentityCredentials
 from matimo_agdk.tools import ToolDecision
@@ -59,6 +60,7 @@ def test_observe_mode_never_calls_check_tool() -> None:
 
     gov = MagicMock()
     gov.check_tool = MagicMock()
+    gov.check_and_wait = MagicMock()
     gov.tool_span = MagicMock()
 
     tools = govern_tools([_fresh_add_tool()], gov, mode="observe")
@@ -66,6 +68,7 @@ def test_observe_mode_never_calls_check_tool() -> None:
 
     assert result == 3
     gov.check_tool.assert_not_called()
+    gov.check_and_wait.assert_not_called()
     gov.tool_span.assert_called_once()
     assert gov.tool_span.call_args.kwargs["status"] == "completed"
 
@@ -175,12 +178,14 @@ def test_suspended_state_stops_before_tool_call() -> None:
 
     gov = MagicMock()
     gov.check_tool = MagicMock(return_value=ToolDecision(decision="ALLOW"))
+    gov.check_and_wait = MagicMock(return_value=ToolDecision(decision="ALLOW"))
     gov.raise_if_suspended.side_effect = AgentSuspendedLocally("suspended", False)
 
     tools = govern_tools([_fresh_add_tool()], gov, mode="govern")
     with pytest.raises(AgentSuspendedLocally):
         tools[0].invoke({"a": 1, "b": 1})
     gov.check_tool.assert_not_called()
+    gov.check_and_wait.assert_not_called()
 
 
 def test_suspended_state_stops_before_llm_boundary_via_callback() -> None:
@@ -302,3 +307,182 @@ def test_gateway_chat_model_rejects_unknown_provider() -> None:
     gov = MagicMock()
     with pytest.raises(ValueError):
         gateway_chat_model(gov, provider="bogus")
+
+
+def test_llm_and_tool_spans_reach_the_exporter_through_real_builders() -> None:
+    """A MagicMock governor accepts any kwargs, so it cannot catch a kwarg the
+    span builders don't know about (`span_id`/`parent_span_id` were silently
+    dropped that way). Run the real builders against a mock exporter."""
+    import uuid
+
+    from matimo_agdk.adapters.langchain import MatimoCallbackHandler
+    from matimo_agdk.governor import Governor
+
+    gov = Governor.__new__(Governor)
+
+    gov.config = GatewayConfig()
+    gov._telemetry = MagicMock()
+    handler = MatimoCallbackHandler(gov, mode="observe")
+
+    chain_id, llm_id = uuid.uuid4(), uuid.uuid4()
+
+    class FakeResult:
+        llm_output = {"model_name": "gpt-4o-mini", "token_usage": {}}
+        generations = [[]]
+
+    handler.on_chain_start({}, {}, run_id=chain_id, parent_run_id=None)
+    handler.on_chat_model_start({"kwargs": {}}, [[]], run_id=llm_id, parent_run_id=chain_id)
+    handler.on_llm_end(FakeResult(), run_id=llm_id, parent_run_id=chain_id)
+
+    events = [c.args[0] for c in gov._telemetry.submit.call_args_list]
+    assert [e["kind"] for e in events] == ["run", "llm"]
+    llm = events[1]
+    assert llm["runId"] == str(chain_id)
+    assert llm["spanId"] == str(llm_id)
+    assert llm["parentSpanId"] == str(chain_id)
+
+
+# ---------------------------------------------------------------------------
+# Run lifecycle: Gateway only ends a run on a terminal kind:"run" span
+# ---------------------------------------------------------------------------
+
+
+def _real_governor_with_mock_exporter() -> Any:
+    from matimo_agdk.governor import Governor
+
+    gov = Governor.__new__(Governor)
+
+    gov.config = GatewayConfig()
+    gov._telemetry = MagicMock()
+    return gov
+
+
+def _events(gov: Any) -> list[dict[str, Any]]:
+    return [c.args[0] for c in gov._telemetry.submit.call_args_list]
+
+
+class _FakeLLMResult:
+    llm_output = {"model_name": "gpt-4o-mini", "token_usage": {}}
+    generations = [[]]
+
+
+def test_standalone_llm_call_opens_and_closes_its_own_run() -> None:
+    """Regression: a parentless LLM call outside governor.run() used to emit a
+    span under a fresh run_id and never a terminal run span, leaving the run
+    `running` in Gateway."""
+    import uuid
+
+    from matimo_agdk.adapters.langchain import MatimoCallbackHandler
+
+    gov = _real_governor_with_mock_exporter()
+    handler = MatimoCallbackHandler(gov, mode="observe")
+    llm_id = uuid.uuid4()
+
+    handler.on_chat_model_start({"kwargs": {}}, [[]], run_id=llm_id, parent_run_id=None)
+    handler.on_llm_end(_FakeLLMResult(), run_id=llm_id, parent_run_id=None)
+
+    events = _events(gov)
+    assert [(e["kind"], e["status"]) for e in events] == [
+        ("run", "running"),
+        ("llm", "completed"),
+        ("run", "completed"),
+    ]
+    assert {e["runId"] for e in events} == {str(llm_id)}
+
+
+def test_standalone_tool_call_opens_and_closes_its_own_run() -> None:
+    import uuid
+
+    from matimo_agdk.adapters.langchain import MatimoCallbackHandler
+
+    gov = _real_governor_with_mock_exporter()
+    handler = MatimoCallbackHandler(gov, mode="observe")
+    tool_id = uuid.uuid4()
+
+    handler.on_tool_start({"name": "add"}, "1+1", run_id=tool_id, parent_run_id=None)
+    handler.on_tool_end("2", run_id=tool_id, parent_run_id=None, name="add")
+
+    events = _events(gov)
+    assert [(e["kind"], e["status"]) for e in events] == [
+        ("run", "running"),
+        ("tool", "completed"),
+        ("run", "completed"),
+    ]
+    assert events[0]["name"] == "add"
+
+
+def test_run_is_closed_failed_when_the_root_errors() -> None:
+    import uuid
+
+    from matimo_agdk.adapters.langchain import MatimoCallbackHandler
+
+    gov = _real_governor_with_mock_exporter()
+    handler = MatimoCallbackHandler(gov, mode="observe")
+    chain_id = uuid.uuid4()
+
+    handler.on_chain_start({}, {}, run_id=chain_id, parent_run_id=None)
+    handler.on_chain_error(RuntimeError("boom"), run_id=chain_id, parent_run_id=None)
+
+    assert [(e["kind"], e["status"]) for e in _events(gov)] == [
+        ("run", "running"),
+        ("run", "failed"),
+    ]
+
+
+def test_only_the_root_node_owns_the_run() -> None:
+    """Chain -> LLM -> tool under one root: one run opened, one closed, and the
+    terminal span comes after the child spans."""
+    import uuid
+
+    from matimo_agdk.adapters.langchain import MatimoCallbackHandler
+
+    gov = _real_governor_with_mock_exporter()
+    handler = MatimoCallbackHandler(gov, mode="observe")
+    chain_id, llm_id, tool_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    handler.on_chain_start({}, {}, run_id=chain_id, parent_run_id=None)
+    handler.on_chat_model_start({"kwargs": {}}, [[]], run_id=llm_id, parent_run_id=chain_id)
+    handler.on_llm_end(_FakeLLMResult(), run_id=llm_id, parent_run_id=chain_id)
+    handler.on_tool_start({"name": "add"}, "1", run_id=tool_id, parent_run_id=chain_id)
+    handler.on_tool_end("2", run_id=tool_id, parent_run_id=chain_id, name="add")
+    handler.on_chain_end({}, run_id=chain_id, parent_run_id=None)
+
+    events = _events(gov)
+    assert [(e["kind"], e["status"]) for e in events] == [
+        ("run", "running"),
+        ("llm", "completed"),
+        ("tool", "completed"),
+        ("run", "completed"),
+    ]
+    assert {e["runId"] for e in events} == {str(chain_id)}
+
+
+def test_calls_inside_governor_run_join_it_and_open_no_run_of_their_own() -> None:
+    """The bug from the live demo: two separate parentless calls inside one
+    `governor.run()` each became their own never-closed run. They must join the
+    ambient run, which governor.run() itself opens and closes."""
+    import uuid
+
+    from matimo_agdk.adapters.langchain import MatimoCallbackHandler
+
+    gov = _real_governor_with_mock_exporter()
+    handler = MatimoCallbackHandler(gov, mode="observe")
+    llm_id, tool_id = uuid.uuid4(), uuid.uuid4()
+
+    with gov.run("demo") as ambient:
+        handler.on_chat_model_start({"kwargs": {}}, [[]], run_id=llm_id, parent_run_id=None)
+        handler.on_llm_end(_FakeLLMResult(), run_id=llm_id, parent_run_id=None)
+        handler.on_tool_start({"name": "add"}, "1", run_id=tool_id, parent_run_id=None)
+        handler.on_tool_end("2", run_id=tool_id, parent_run_id=None, name="add")
+
+    events = _events(gov)
+    assert [(e["kind"], e["status"]) for e in events] == [
+        ("run", "running"),
+        ("llm", "completed"),
+        ("tool", "completed"),
+        ("run", "completed"),
+    ]
+    assert {e["runId"] for e in events} == {ambient}
+    # The per-node ids are still distinct span ids under that one run.
+    assert events[1]["spanId"] == str(llm_id)
+    assert events[2]["spanId"] == str(tool_id)

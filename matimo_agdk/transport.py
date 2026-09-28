@@ -26,9 +26,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import random
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +44,7 @@ from .exceptions import (
     RateLimited,
     SessionExpired,
     SignatureRejected,
+    SpendCapExceeded,
     TelemetryStale,
 )
 from .identity import JWSSigner
@@ -65,15 +68,22 @@ class GatewayResponse:
 
 class RetryPolicy:
     def __init__(
-        self, max_retries: int = 3, base_delay: float = 0.5, max_delay: float = 20.0
+        self,
+        max_retries: int = 3,
+        base_delay: float = 0.5,
+        max_delay: float = 20.0,
+        max_retry_after: float = 60.0,
     ) -> None:
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
+        self.max_retry_after = max_retry_after
 
     def delay_for(self, attempt: int, retry_after: float | None) -> float:
         if retry_after is not None:
-            return max(retry_after, 0.0)
+            # A server-supplied Retry-After is honored but never trusted past
+            # max_retry_after: one hostile or buggy header must not park a thread for hours.
+            return min(max(retry_after, 0.0), self.max_retry_after)
         raw = min(self.base_delay * (2**attempt), self.max_delay)
         # Decorrelated-ish jitter: half to full of the computed backoff.
         return random.uniform(raw / 2, raw)
@@ -83,12 +93,16 @@ def parse_retry_after(value: str | None) -> float | None:
     if not value:
         return None
     try:
-        return float(value)
+        seconds = float(value)
     except ValueError:
         return None  # an HTTP-date Retry-After is not parsed in v1
+    # float() accepts "nan" and "inf"; neither is a usable delay.
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
-def raise_for_error(status_code: int, body: Mapping[str, Any] | None) -> None:
+def raise_for_error(
+    status_code: int, body: Mapping[str, Any] | None, retry_after: float | None = None
+) -> None:
     """Maps Gateway's flat {error, message?} envelope to a typed exception.
     Always raises when status_code >= 400 -- callers rely on this."""
     body = body or {}
@@ -110,8 +124,17 @@ def raise_for_error(status_code: int, body: Mapping[str, Any] | None) -> None:
         if reason in _AGENT_SUSPENDED_REASONS:
             raise AgentSuspended(reason, status_code=status_code, code=code)
         raise PolicyDenied(reason, status_code=status_code, code=code)
+    if status_code == 403 and code == "spend_cap_exceeded":
+        raise SpendCapExceeded(
+            message or "LLM budget cap exceeded", status_code=status_code, code=code
+        )
     if status_code == 429:
-        raise RateLimited(message or "rate_limit_exceeded", status_code=status_code, code=code)
+        raise RateLimited(
+            message or "rate_limit_exceeded",
+            status_code=status_code,
+            code=code,
+            retry_after=retry_after,
+        )
     if status_code == 502:
         raise GatewayUnavailable(message or "upstream error", status_code=status_code, code=code)
     if status_code >= 400:
@@ -128,7 +151,11 @@ def _finish_response(resp: httpx.Response) -> GatewayResponse:
         except ValueError:
             body = None
     if resp.status_code >= 400:
-        raise_for_error(resp.status_code, body if isinstance(body, dict) else None)
+        raise_for_error(
+            resp.status_code,
+            body if isinstance(body, dict) else None,
+            parse_retry_after(resp.headers.get("Retry-After")),
+        )
         # raise_for_error() always raises for >= 400; this is unreachable
         # in practice and exists only so type checkers see a return.
         raise GatewayError(f"gateway error ({resp.status_code})", status_code=resp.status_code)
@@ -250,6 +277,33 @@ class GatewayHTTP(_HeaderMixin):
 
             return _finish_response(resp)
 
+    @contextmanager
+    def stream_get(
+        self,
+        path: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        read_timeout: float = 45.0,
+    ) -> Iterator[httpx.Response]:
+        """Opens a long-lived GET whose body is read incrementally (Server-Sent
+        Events). One attempt and no retry: the caller owns reconnection. A
+        >= 400 answer raises the same typed error request() would; a transport
+        failure, including a read timeout while iterating, raises
+        GatewayUnavailable. `read_timeout` bounds the silence between two
+        chunks, so it must exceed the server's keepalive interval."""
+        req_headers = self._base_headers(headers)
+        req_headers.pop("Content-Type", None)
+        req_headers["Accept"] = "text/event-stream"
+        timeout = httpx.Timeout(read_timeout, connect=10.0)
+        try:
+            with self._client.stream("GET", path, headers=req_headers, timeout=timeout) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    _finish_response(resp)  # always raises for >= 400
+                yield resp
+        except httpx.TransportError as exc:
+            raise GatewayUnavailable(str(exc)) from exc
+
 
 class AsyncGatewayHTTP(_HeaderMixin):
     """Async transport. Owns one pooled httpx.AsyncClient."""
@@ -333,3 +387,27 @@ class AsyncGatewayHTTP(_HeaderMixin):
                 continue
 
             return _finish_response(resp)
+
+    @asynccontextmanager
+    async def stream_get(
+        self,
+        path: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        read_timeout: float = 45.0,
+    ) -> AsyncIterator[httpx.Response]:
+        """Async twin of GatewayHTTP.stream_get()."""
+        req_headers = self._base_headers(headers)
+        req_headers.pop("Content-Type", None)
+        req_headers["Accept"] = "text/event-stream"
+        timeout = httpx.Timeout(read_timeout, connect=10.0)
+        try:
+            async with self._client.stream(
+                "GET", path, headers=req_headers, timeout=timeout
+            ) as resp:
+                if resp.status_code >= 400:
+                    await resp.aread()
+                    _finish_response(resp)  # always raises for >= 400
+                yield resp
+        except httpx.TransportError as exc:
+            raise GatewayUnavailable(str(exc)) from exc

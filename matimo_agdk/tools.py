@@ -21,9 +21,11 @@ import random
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import quote
 
-from ._redact import redact
-from .exceptions import GatewayError, ToolCheckTimeout
+from ._outage import OutageGuard, is_transport_failure
+from ._redact import redact, scrub_string
+from .exceptions import GatewayError, ToolCheckTimeout, ToolCheckUnavailable
 from .transport import AsyncGatewayHTTP, GatewayHTTP
 
 Decision = Literal["ALLOW", "DENY", "PENDING"]
@@ -32,12 +34,27 @@ IDENTITY_TOKEN_HEADER = "X-Matimo-Agent-Identity-Token"
 
 _MAX_ARG_VALUE_LEN = 2000
 
-# TRD section 4.3's decided polling posture: 2s initial, doubling to a 60s
-# ceiling, with jitter, bounded by the server's own 4-hour approval TTL
+# TRD section 4.3's decided polling posture: 3s initial, doubling to a 60s
+# ceiling, with +/-10% jitter, bounded by the server's own 4-hour approval TTL
 # (docs/SERVER-CONTRACT.md section 8.1).
 DEFAULT_POLL_INTERVAL_SECONDS = 3.0
 DEFAULT_POLL_MAX_INTERVAL_SECONDS = 60.0
 DEFAULT_MAX_WAIT_SECONDS = 4 * 3600.0
+
+# Gateway answers PENDING with *no* resumeToken when an identical check is
+# already in flight (reason "duplicate_check_in_flight"): the caller has
+# nothing to poll. The in-flight check's answer is cached server-side for
+# 15 minutes, so re-sending the same check shortly after returns it (with
+# the token). Re-check after each of these delays; if it is still tokenless
+# after the last one, fail closed rather than run an unapproved tool.
+DEFAULT_RECHECK_DELAYS = (0.5, 1.0, 2.0, 4.0)
+NO_RESUME_TOKEN_DENY_REASON = "tool_check_pending_without_resume_token"
+
+# The contract's decision enum is exactly ALLOW | DENY | PENDING. Anything else
+# (server drift, a proxy rewriting the body, a missing field) is treated as a DENY:
+# a governance check that cannot be understood must never let the tool run.
+UNRECOGNIZED_DECISION_DENY_REASON = "unrecognized_tool_check_decision"
+_VALID_DECISIONS = frozenset({"ALLOW", "DENY", "PENDING"})
 
 
 def redact_args(args: dict[str, Any]) -> dict[str, Any]:
@@ -62,6 +79,12 @@ class ToolDecision:
     reason: str | None = None
     resume_token: str | None = None
     request_id: str | None = None
+    # True for an ALLOW the SDK granted itself because Gateway could not answer
+    # and tool_check_failure_mode="fail_open_bounded" permitted it. Never set
+    # for a decision Gateway actually rendered. `degraded_age_seconds` is how
+    # long ago Gateway was last heard from.
+    degraded: bool = False
+    degraded_age_seconds: float | None = None
 
     @property
     def allowed(self) -> bool:
@@ -74,6 +97,11 @@ class ToolDecision:
     @property
     def pending(self) -> bool:
         return self.decision == "PENDING"
+
+    @property
+    def pending_without_token(self) -> bool:
+        """PENDING but nothing to poll -- see DEFAULT_RECHECK_DELAYS."""
+        return self.pending and not self.resume_token
 
 
 def _check_body(
@@ -88,12 +116,42 @@ def _check_body(
 
 
 def _decision_from(data: dict[str, Any]) -> ToolDecision:
+    decision = data.get("decision")
+    if decision not in _VALID_DECISIONS:
+        return ToolDecision(
+            decision="DENY",
+            reason=UNRECOGNIZED_DECISION_DENY_REASON,
+            request_id=data.get("requestId"),
+        )
     return ToolDecision(
-        decision=data["decision"],
+        decision=decision,
         reason=data.get("reason"),
         resume_token=data.get("resumeToken"),
         request_id=data.get("requestId"),
     )
+
+
+def _is_recognized(data: dict[str, Any]) -> bool:
+    return data.get("decision") in _VALID_DECISIONS
+
+
+def _report_body(
+    resume_token: str, status: str, duration_ms: int | None, error: str | None
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"resumeToken": resume_token, "status": status}
+    if duration_ms is not None:
+        body["durationMs"] = duration_ms
+    if error is not None:
+        # Exception messages routinely carry connection strings and tokens.
+        body["error"] = scrub_string(error)[:2000]
+    return body
+
+
+def _category_path(tool_name: str) -> str:
+    # Percent-encode everything, "/" and "." segments included: an unquoted tool
+    # name such as "../identities/x" would otherwise be normalised by the HTTP
+    # client into a different route, sent with the org API key.
+    return f"/tools/{quote(tool_name, safe='')}/category"
 
 
 class ToolGovernor:
@@ -110,6 +168,8 @@ class ToolGovernor:
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         poll_max_interval: float = DEFAULT_POLL_MAX_INTERVAL_SECONDS,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
+        recheck_delays: tuple[float, ...] = DEFAULT_RECHECK_DELAYS,
+        outage: OutageGuard | None = None,
     ) -> None:
         self._http = http
         self._identity_token = identity_token
@@ -119,9 +179,39 @@ class ToolGovernor:
         self.poll_interval = poll_interval
         self.poll_max_interval = poll_max_interval
         self.max_wait_seconds = max_wait_seconds
+        self.recheck_delays = recheck_delays
+        # Circuit breaker and fail-open policy for when Gateway cannot answer a
+        # check; the default is fail_closed with a 3-failure, 30s breaker.
+        self.outage = outage or OutageGuard()
+
+    def rebind(
+        self,
+        *,
+        identity_token: str,
+        identity_id: str,
+        tenant_id: str,
+        external_framework: str | None = None,
+    ) -> None:
+        """Adopts a rotated identity in place, so a `guard()`-wrapped callable
+        that captured this object keeps working after `rotate_key()`."""
+        self._identity_token = identity_token
+        self._identity_id = identity_id
+        self._tenant_id = tenant_id
+        self._external_framework = external_framework
 
     def _headers(self) -> dict[str, str]:
-        return {IDENTITY_TOKEN_HEADER: self._identity_token}
+        # Deferred import: governor.py imports ToolGovernor/AsyncToolGovernor
+        # (see tools.py's own module docstring context and _outage.py for the
+        # same pattern), so a top-of-file `from .governor import ...` here
+        # would be circular. RUN_ID_HEADER/current_run_id are already defined
+        # by the time this runs.
+        from .governor import RUN_ID_HEADER, current_run_id
+
+        headers = {IDENTITY_TOKEN_HEADER: self._identity_token}
+        run_id = current_run_id()
+        if run_id:
+            headers[RUN_ID_HEADER] = run_id
+        return headers
 
     def _sign_kwargs(self) -> dict[str, Any]:
         return dict(
@@ -131,6 +221,34 @@ class ToolGovernor:
             external_framework=self._external_framework,
         )
 
+    def check_and_wait(
+        self,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        category_hint: str | None = None,
+    ) -> ToolDecision:
+        """check(), then whatever it takes to reach a final ALLOW or DENY.
+
+        PENDING with a resume token is polled to a decision. PENDING with no
+        token is re-checked (see DEFAULT_RECHECK_DELAYS) and, if it never
+        yields one, becomes a DENY -- never a PENDING the caller might treat
+        as "not denied" and run the tool on."""
+        decision = self.check(tool_name, args, category_hint=category_hint)
+        if decision.degraded:
+            return decision
+        for delay in self.recheck_delays:
+            if not decision.pending_without_token:
+                break
+            time.sleep(delay * random.uniform(0.9, 1.1))
+            # A PENDING is never failed open: re-check without the outage fallback.
+            decision = self._check_raw(tool_name, args, category_hint=category_hint)
+        if decision.pending_without_token:
+            return ToolDecision(decision="DENY", reason=NO_RESUME_TOKEN_DENY_REASON)
+        if decision.pending and decision.resume_token:
+            return self.await_decision(decision.resume_token)
+        return decision
+
     def check(
         self,
         tool_name: str,
@@ -139,14 +257,52 @@ class ToolGovernor:
         category_hint: str | None = None,
         include_args: bool = True,
     ) -> ToolDecision:
-        resp = self._http.request(
-            "POST",
-            "/tools/check",
-            json_body=_check_body(tool_name, args, category_hint, include_args),
-            headers=self._headers(),
-            **self._sign_kwargs(),
-        )
-        return _decision_from(resp.data or {})
+        """One /tools/check call. If Gateway cannot answer at all (a connection
+        error, timeout or 5xx, or the circuit breaker is open), the configured
+        `tool_check_failure_mode` decides: raise ToolCheckUnavailable
+        (`fail_closed`, the default), or return a degraded ALLOW
+        (`fail_open_bounded`, only when every condition in matimo_agdk._outage
+        holds). A DENY, an unrecognized decision and any 4xx are never softened."""
+        try:
+            return self._check_raw(
+                tool_name, args, category_hint=category_hint, include_args=include_args
+            )
+        except ToolCheckUnavailable as exc:
+            return self.outage.degrade(tool_name, exc)
+
+    def _check_raw(
+        self,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        category_hint: str | None = None,
+        include_args: bool = True,
+    ) -> ToolDecision:
+        """check() without the fail-open fallback: breaker-gated, and a
+        transport-level failure raises ToolCheckUnavailable."""
+        self.outage.before_call()
+        try:
+            resp = self._http.request(
+                "POST",
+                "/tools/check",
+                json_body=_check_body(tool_name, args, category_hint, include_args),
+                headers=self._headers(),
+                idempotent=True,
+                **self._sign_kwargs(),
+            )
+        except GatewayError as exc:
+            if is_transport_failure(exc):
+                raise self.outage.transport_failed(exc) from exc
+            self.outage.reachable()
+            raise
+        except BaseException:
+            self.outage.aborted()
+            raise
+        self.outage.reachable()
+        data = resp.data or {}
+        decision = _decision_from(data)
+        self.outage.record_decision(tool_name, decision.decision, recognized=_is_recognized(data))
+        return decision
 
     def status(self, resume_token: str) -> ToolDecision:
         resp = self._http.request(
@@ -154,8 +310,10 @@ class ToolGovernor:
             "/tools/check/status",
             json_body={"resumeToken": resume_token},
             headers=self._headers(),
+            idempotent=True,
             **self._sign_kwargs(),
         )
+        self.outage.record_contact()
         return _decision_from(resp.data or {})
 
     def await_decision(
@@ -165,7 +323,7 @@ class ToolGovernor:
         poll_interval: float | None = None,
         max_wait_seconds: float | None = None,
     ) -> ToolDecision:
-        """Blocking poll with decorrelated-jitter exponential backoff."""
+        """Blocking poll with exponential backoff and +/-10% jitter."""
         interval = poll_interval if poll_interval is not None else self.poll_interval
         budget = max_wait_seconds if max_wait_seconds is not None else self.max_wait_seconds
         deadline = time.monotonic() + budget
@@ -191,11 +349,7 @@ class ToolGovernor:
     ) -> None:
         """Fire-and-forget: persists nothing queryable server-side today
         (docs/SERVER-CONTRACT.md section 8.3). Swallows GatewayError."""
-        body: dict[str, Any] = {"resumeToken": resume_token, "status": status}
-        if duration_ms is not None:
-            body["durationMs"] = duration_ms
-        if error is not None:
-            body["error"] = error[:2000]
+        body = _report_body(resume_token, status, duration_ms, error)
         try:
             self._http.request(
                 "POST",
@@ -211,7 +365,7 @@ class ToolGovernor:
         """Tenant-wide admin action, identity:manage scoped, unsigned."""
         self._http.request(
             "PUT",
-            f"/tools/{tool_name}/category",
+            _category_path(tool_name),
             json_body={"category": category},
             sign=False,
         )
@@ -231,6 +385,8 @@ class AsyncToolGovernor:
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         poll_max_interval: float = DEFAULT_POLL_MAX_INTERVAL_SECONDS,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
+        recheck_delays: tuple[float, ...] = DEFAULT_RECHECK_DELAYS,
+        outage: OutageGuard | None = None,
     ) -> None:
         self._http = http
         self._identity_token = identity_token
@@ -240,9 +396,35 @@ class AsyncToolGovernor:
         self.poll_interval = poll_interval
         self.poll_max_interval = poll_max_interval
         self.max_wait_seconds = max_wait_seconds
+        self.recheck_delays = recheck_delays
+        # Circuit breaker and fail-open policy for when Gateway cannot answer a
+        # check; the default is fail_closed with a 3-failure, 30s breaker.
+        self.outage = outage or OutageGuard()
+
+    def rebind(
+        self,
+        *,
+        identity_token: str,
+        identity_id: str,
+        tenant_id: str,
+        external_framework: str | None = None,
+    ) -> None:
+        """Adopts a rotated identity in place, so a `guard()`-wrapped callable
+        that captured this object keeps working after `rotate_key()`."""
+        self._identity_token = identity_token
+        self._identity_id = identity_id
+        self._tenant_id = tenant_id
+        self._external_framework = external_framework
 
     def _headers(self) -> dict[str, str]:
-        return {IDENTITY_TOKEN_HEADER: self._identity_token}
+        # See ToolGovernor._headers() -- same deferred-import circularity fix.
+        from .governor import RUN_ID_HEADER, current_run_id
+
+        headers = {IDENTITY_TOKEN_HEADER: self._identity_token}
+        run_id = current_run_id()
+        if run_id:
+            headers[RUN_ID_HEADER] = run_id
+        return headers
 
     def _sign_kwargs(self) -> dict[str, Any]:
         return dict(
@@ -252,6 +434,29 @@ class AsyncToolGovernor:
             external_framework=self._external_framework,
         )
 
+    async def check_and_wait(
+        self,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        category_hint: str | None = None,
+    ) -> ToolDecision:
+        """Async twin of ToolGovernor.check_and_wait()."""
+        decision = await self.check(tool_name, args, category_hint=category_hint)
+        if decision.degraded:
+            return decision
+        for delay in self.recheck_delays:
+            if not decision.pending_without_token:
+                break
+            await asyncio.sleep(delay * random.uniform(0.9, 1.1))
+            # A PENDING is never failed open: re-check without the outage fallback.
+            decision = await self._check_raw(tool_name, args, category_hint=category_hint)
+        if decision.pending_without_token:
+            return ToolDecision(decision="DENY", reason=NO_RESUME_TOKEN_DENY_REASON)
+        if decision.pending and decision.resume_token:
+            return await self.await_decision(decision.resume_token)
+        return decision
+
     async def check(
         self,
         tool_name: str,
@@ -260,14 +465,51 @@ class AsyncToolGovernor:
         category_hint: str | None = None,
         include_args: bool = True,
     ) -> ToolDecision:
-        resp = await self._http.request(
-            "POST",
-            "/tools/check",
-            json_body=_check_body(tool_name, args, category_hint, include_args),
-            headers=self._headers(),
-            **self._sign_kwargs(),
-        )
-        return _decision_from(resp.data or {})
+        """One /tools/check call. If Gateway cannot answer at all (a connection
+        error, timeout or 5xx, or the circuit breaker is open), the configured
+        `tool_check_failure_mode` decides: raise ToolCheckUnavailable
+        (`fail_closed`, the default), or return a degraded ALLOW
+        (`fail_open_bounded`, only when every condition in matimo_agdk._outage
+        holds). A DENY, an unrecognized decision and any 4xx are never softened."""
+        try:
+            return await self._check_raw(
+                tool_name, args, category_hint=category_hint, include_args=include_args
+            )
+        except ToolCheckUnavailable as exc:
+            return self.outage.degrade(tool_name, exc)
+
+    async def _check_raw(
+        self,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        category_hint: str | None = None,
+        include_args: bool = True,
+    ) -> ToolDecision:
+        """See ToolGovernor._check_raw()."""
+        self.outage.before_call()
+        try:
+            resp = await self._http.request(
+                "POST",
+                "/tools/check",
+                json_body=_check_body(tool_name, args, category_hint, include_args),
+                headers=self._headers(),
+                idempotent=True,
+                **self._sign_kwargs(),
+            )
+        except GatewayError as exc:
+            if is_transport_failure(exc):
+                raise self.outage.transport_failed(exc) from exc
+            self.outage.reachable()
+            raise
+        except BaseException:
+            self.outage.aborted()
+            raise
+        self.outage.reachable()
+        data = resp.data or {}
+        decision = _decision_from(data)
+        self.outage.record_decision(tool_name, decision.decision, recognized=_is_recognized(data))
+        return decision
 
     async def status(self, resume_token: str) -> ToolDecision:
         resp = await self._http.request(
@@ -275,8 +517,10 @@ class AsyncToolGovernor:
             "/tools/check/status",
             json_body={"resumeToken": resume_token},
             headers=self._headers(),
+            idempotent=True,
             **self._sign_kwargs(),
         )
+        self.outage.record_contact()
         return _decision_from(resp.data or {})
 
     async def await_decision(
@@ -309,11 +553,7 @@ class AsyncToolGovernor:
         duration_ms: int | None = None,
         error: str | None = None,
     ) -> None:
-        body: dict[str, Any] = {"resumeToken": resume_token, "status": status}
-        if duration_ms is not None:
-            body["durationMs"] = duration_ms
-        if error is not None:
-            body["error"] = error[:2000]
+        body = _report_body(resume_token, status, duration_ms, error)
         try:
             await self._http.request(
                 "POST",
@@ -328,7 +568,7 @@ class AsyncToolGovernor:
     async def set_category(self, tool_name: str, category: str) -> None:
         await self._http.request(
             "PUT",
-            f"/tools/{tool_name}/category",
+            _category_path(tool_name),
             json_body={"category": category},
             sign=False,
         )
