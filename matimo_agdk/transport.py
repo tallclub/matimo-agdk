@@ -44,6 +44,7 @@ from .exceptions import (
     RateLimited,
     SessionExpired,
     SignatureRejected,
+    SpendCapExceeded,
     TelemetryStale,
 )
 from .identity import JWSSigner
@@ -123,6 +124,10 @@ def raise_for_error(
         if reason in _AGENT_SUSPENDED_REASONS:
             raise AgentSuspended(reason, status_code=status_code, code=code)
         raise PolicyDenied(reason, status_code=status_code, code=code)
+    if status_code == 403 and code == "spend_cap_exceeded":
+        raise SpendCapExceeded(
+            message or "LLM budget cap exceeded", status_code=status_code, code=code
+        )
     if status_code == 429:
         raise RateLimited(
             message or "rate_limit_exceeded",

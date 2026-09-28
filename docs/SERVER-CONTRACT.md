@@ -45,8 +45,8 @@ Base URL for local dev: `http://localhost:8000/v1` (matches
   2026-09-13, `gateway.ts:946`, `:1074`; `GatewayProxyService.ts:196-202` , the `error` variant of
   `GatewayChatCompletionOutcome` carries `overheadMs` specifically so this header is never skipped
   on a policy_denied/spend_cap_exceeded/etc. error). No other route sets this header.
-- **No `GET /v1/health` or `GET /v1/models` route exists.** Confirmed by reading the entire file
-  (`gateway.ts`, 1633 lines) , the only routes are the fourteen listed in §1.
+- **No `GET /v1/models` route exists.** `GET /v1/health` DOES exist (added 2026-09-22, QUALITY-REVIEW
+  item 11) , see the route table in §1 and §3.7.
 - **Rate-limit response**: `429 { error: "rate_limit_exceeded" }`, no `Retry-After` header, no
   body detail (`gateway.ts:801`, `:812`, `:868`, `:779`). `GatewaySlidingWindowLimiter` fails
   **open** on a Redis error (`GatewaySlidingWindowLimiter.ts:18-21` doc comment) , a rate-limit
@@ -58,6 +58,7 @@ Base URL for local dev: `http://localhost:8000/v1` (matches
 
 | Method | Path | Scope required | Session required | JWS (`Matimo-Agent-Signature`) |
 |---|---|---|---|---|
+| GET | `/v1/health` | none , any valid, licensed org API key (or virtual key, see §2) | no | no (added 2026-09-22, §3.7) |
 | POST | `/v1/chat/completions` | `gateway:proxy` | yes (`resolveSession`) | optional, enforced only if `identity.requireSignedRequests` OR `license.gatewayRequireSignedRequestsDefault` |
 | POST | `/v1/messages` | `gateway:proxy` | yes | same opt-in enforcement as above |
 | POST | `/v1/telemetry/batch` | `gateway:proxy` | yes | **not checked at all** (see Drift #2) |
@@ -112,6 +113,17 @@ error: "license_required", message: "An active Matimo Enterprise license is requ
 Gateway" }`. Expired (`expiresAt < now`) → same code, message "...has expired". On success this
 middleware also stashes `ctx.allowUnregisteredGatewayAccess` and `ctx.auditWriteMode` (`'sync'` if
 `license.gatewaySyncAudit`, else `'async'`) for downstream use , **not** exposed to the client.
+
+**Virtual keys** (added 2026-09-25/26, `mvk-live-` prefix, `GatewayVirtualKeyService`, distinct
+credential family from `me-live-` org keys , see `resolveVirtualKeyAuth`, `gateway.ts`): a
+budget/rate-limit/model-allowlist delegation credential, self-serve-issuable, that an admin hands
+to (say) a team or a script instead of the org's own key. It carries `SCOPE_GATEWAY_PROXY` +
+`SCOPE_AGDK_CHECK` (`agdk:check`, added 2026-09-26) and **never** `identity:manage` , a virtual key
+can authenticate `/v1/chat/completions`, `/v1/messages`, and `/v1/tools/check`, but can never
+register/rotate/manage an identity. This is transparent to AGDK's own transport , `config.api_key`
+is just a bearer string, and the SDK does not special-case the `mvk-` vs `me-live-` prefix; the
+identity token + JWS signature still separately gate `/v1/tools/check` regardless of which key
+family authenticated the request.
 
 ---
 
@@ -242,8 +254,31 @@ lifecycleStatus, riskClassification, externalFramework } }` (`external-policy-ch
 tenant , cross-tenant match is also 404 (never confirms existence under a different tenant,
 `:156-159`).
 
-**This is the only "poll my own status" endpoint that exists anywhere in the codebase** , see §7
-for why it matters and what is *not* built.
+**This was, until 2026-09-22, the only "poll my own status" endpoint anywhere in the codebase**
+, see §3.7 for the narrower `/v1` probe added since, and §7 for the telemetry heartbeat (the real
+richer status signal AGDK actually polls in practice).
+
+### 3.7. `GET /v1/health` , cheap status probe (added 2026-09-22, QUALITY-REVIEW item 11,
+`gateway.ts`, `Governor.check_health()`/`AsyncGovernor.check_health()`)
+
+Router-wide `apiKeyAuth` + `licenseGate` only , no `requireScope`, no `resolveIdentity`/
+`resolveSession`, no identity needed at all. Confirms the org API key (or virtual key, see §2) is
+valid and the tenant's Matimo Enterprise license is active, without registering an identity or
+opening a session , the cheapest possible "is my setup even correct" check, and the reason it was
+added: before it existed the only way to answer that question was a real `POST /v1/identities`
+call (AGDK's own `scripts/live_check.py` used to do exactly this as a preflight step), and every
+registered identity is permanent (§10) , that workaround left an inert row behind on every run.
+
+**Response**: `200 { data: { status: "ok", license: { active: true, mode: string | null,
+emergencyStopActive: boolean }, serverTime: string } }`. `license.active` is always `true` on a 200
+, `licenseGate` already rejects an inactive/expired license with `403 license_required` before this
+handler ever runs, so that 403 itself is the "license inactive" signal, not a field in this body.
+No secrets in the response: no identity id, no token, no tenant id.
+
+Does **not** answer "am I (a specific identity) suspended" , that is still only the telemetry
+heartbeat (§7) or the legacy per-identity status poll (§3.6). Use this route for a pre-registration
+sanity check (`matimo-agdk doctor` calls it first, before requiring a registered identity) or a
+CI/deploy-time "is this API key still good" probe, not for rapid-suspend detection.
 
 ---
 
@@ -579,8 +614,16 @@ as "this response was intercepted by a guardrail," not as an error to retry.
 | 400 | `no_default_connection` | model omitted, no default BYOK connection | yes |
 | 400 | `non_byok_connection` | resolved target is `nova_managed`/`nova_credits` | yes |
 | 403 | `policy_denied` | `AgentGatewayService` returned DENY or `emergency_stop` | **yes , `message` is the machine-readable `decision.reason`** (see table below), not generic text |
-| 403 | `spend_cap_exceeded` | identity's per-call budget cap tripped | **no message field at all** |
+| 403 | `spend_cap_exceeded` | unified LLM budget ledger (tenant/team/user/virtual-key/agent-identity scope, `GatewaySpendCapService`, added 2026-09-25/26) already at/over cap at reserve time , the call is never dispatched | **yes, since 2026-09-26** , a human sentence naming the scope(s) and pointing at `POST /api/v1/budgets/requests` (`GatewayProxyService.describeBudgetBlock()`), not a machine-parseable field |
 | 502 | `upstream_error` | all routing targets (primary + fallbacks) failed to dispatch | yes, fixed string "All configured LLM targets failed" |
+
+**`spend_cap_exceeded` vs. `policy_denied`'s `monthly_budget_exceeded` reason , two different
+mechanisms, don't conflate them.** `monthly_budget_exceeded` (see the reason-string list below) is
+the older, identity-only check inside `AgentGatewayService`'s policy decision, evaluated *before*
+Step 4's spend-cap reservation. `spend_cap_exceeded` is the newer unified ledger , tenant, team,
+user, virtual key, and agent identity all constrain the same call simultaneously, each with its own
+reset period , evaluated *after* the policy decision allows. A call can be denied by either, never
+both at once (the policy check runs first and short-circuits on DENY).
 
 **`policy_denied`'s `message` is the actual denial reason string, not decorative text** , a client
 that wants to distinguish *why* it was denied must parse `message`, since `error` is always the
@@ -728,6 +771,17 @@ sends this , Gateway works identically either way. **`sessionId` on a telemetry 
 `runId`** if you want `matimo_gateway_runs.session_id` populated (found live-testing: omitting it
 means the run's "session: ..." badge never appears in the admin UI, `agent.py:40-46`).
 
+**Also accepted on `POST /v1/tools/check` since 2026-09-22 (BUILD-PLAN F36)** , the same header,
+same `extractRunId()` helper, threaded through to a nullable `run_id` column on
+`matimo_enterprise_governance_approvals`. Before this, a tool-check DENY/PENDING could only be
+approximately correlated to a run by an agent-identity + time-window guess in the Observability
+Hub, and real denials routinely fell outside that window; with `run_id` set, the correlation is an
+exact join. `ToolGovernor`/`AsyncToolGovernor._headers()` in this SDK already send it whenever a
+run is active (`governor.py`'s `current_run_id()`), on `check()`, `status()`, and `report_result()`
+, `set_category()` deliberately does not, since it is a tenant-wide admin action with no identity
+header either. Only PENDING tool checks (the ones that create an approvals row at all) benefit;
+a plain ALLOW/DENY tool check is audit-log-only regardless of `run_id`.
+
 ### 7.3. `GET /v1/control/stream` , push channel for rapid suspend and emergency stop (added 2026-09-21)
 
 Server-Sent Events, on the same session as §4.3 (same auth chain: `apiKeyAuth` -> `licenseGate` ->
@@ -863,11 +917,20 @@ rate-limits this route beyond the shared `proxyRateLimit` (1200/hour per identit
 **Request**: `{ resumeToken: string min1, status: string min1 max20, durationMs?: number (int,
 non-negative), error?: string max2000 }` (`toolResultSchema`, `.strict()`).
 
-**Response**: `202 { data: { accepted: true } }` , **always**, unconditionally. This is
-**best-effort, log-only** in the current implementation (`GatewayToolCheckService.recordResult()`,
-`:187-199` , just calls `logger.info()`, nothing is persisted to any queryable table, not wired
-into telemetry). Optional; a client can skip calling this entirely with no functional
-consequence today.
+**Response**: `202 { data: { accepted: true } }` , **always**, unconditionally, regardless of
+whether the write below succeeds. Still best-effort in that sense (a client cannot detect failure
+from the response), but **no longer log-only** (fixed 2026-09-22, BUILD-PLAN F35):
+`GatewayToolCheckService.recordResult()` now awaits `GovernanceApprovalService.recordToolResult()`,
+which writes `result_status`/`result_duration_ms`/`result_error`/`result_reported_at` onto the
+`matimo_enterprise_governance_approvals` row the `resumeToken` already keys (hashed the same way
+`/tools/check/status` hashes it) , any write failure (unknown/expired resume token, DB error) is
+caught and logged inside `recordResult()`, never surfaced to the caller. A plain `ALLOW` from
+`/tools/check` never gets a resume token, so this can only ever match a row that was genuinely
+`PENDING` at some point. The persisted result is readable via
+`GET /api/v1/enterprise/governance-approvals/:id` and via the matching `tool_check` entry in the
+Gateway Observability Hub's run trace , it is a real, queryable audit record now, not a
+fire-and-forget signal, though a client is still free to skip calling this with no functional
+consequence to its own tool-check flow.
 
 ### 8.4. `PUT /v1/tools/:toolName/category` (`gateway.ts:1600-1631`)
 
@@ -887,6 +950,9 @@ of `/tools/check` ever needing to guess one.
 | `identity:manage` | `/v1/identities`, `/v1/identities/bulk`, `/v1/identities/:id/jwks`, `/v1/identities/:id/rotate-key`, `/v1/routing-policies/:id/external-visibility`, `/v1/tools/:toolName/category` |
 | `agdk:check` | `/v1/tools/check`, `/v1/tools/check/status`, `/v1/tools/result` |
 
+`GET /v1/health` (§3.7) needs none of these , any valid, licensed key clears it regardless of
+scope. A virtual key (§2) can carry `gateway:proxy` + `agdk:check` but never `identity:manage`.
+
 A single AGDK-facing API key should typically carry all three (confirmed pattern:
 `gateway-manual-test.ts:3230` mints `['gateway:proxy', 'identity:manage', 'agdk:check']` together
 for its full-flow scenarios). Missing any one scope → `403 insufficient_scope` naming the missing
@@ -898,7 +964,6 @@ scope in `message`.
 
 - **No `GET /v1/models` endpoint.** A client cannot ask Gateway which models are available; it
   must know the pin ahead of time, use `matimo/auto`, or omit `model` to get the tenant's default.
-- **No `GET /v1/health` endpoint** under this router.
 - **Still no way to interrupt a call already in flight.** A push (§7.3) or the poll can tell the
   client "you are suspended" fast, but the only mechanism that ever stops a Gateway-routed call is
   the **next** `/v1/chat/completions`/`/v1/messages`/`/v1/tools/check` request being denied
@@ -909,13 +974,16 @@ scope in `message`.
   is current.
 - **No bypass-detection** (an identity whose telemetry keeps flowing while its LLM traffic
   silently stops going through Gateway, or vice versa) , confirmed zero code for it.
-- **No AGDK-specific heartbeat/poll endpoint distinct from the legacy `GET
-  /api/v1/enterprise/agents/:token/status`** (§3.6). If AGDK wants a "did I get suspended" signal
-  independent of making an actual governed call, that legacy route (different auth scheme ,
-  `Authorization: ApiKey`, not `Bearer`) is the only thing that exists today. No recommended poll
-  interval is specified anywhere for it.
-- **`POST /v1/tools/result` persists nothing queryable** , treat it as fire-and-forget telemetry,
-  not an audit mechanism a compliance report could rely on today.
+- **No AGDK-specific *lifecycle* poll endpoint under `/v1` distinct from the legacy `GET
+  /api/v1/enterprise/agents/:token/status`** (§3.6). `GET /v1/health` (§3.7, added 2026-09-22)
+  answers "is my API key/license good" under `/v1`, but not "am I (this identity) suspended" , for
+  that, AGDK still relies on the telemetry heartbeat (§7) it already polls, or the legacy status
+  route (different auth scheme , `Authorization: ApiKey`, not `Bearer`). No recommended poll
+  interval is specified anywhere for the legacy route.
+- ~~`POST /v1/tools/result` persists nothing queryable~~ , **fixed 2026-09-22, see §8.3.** It now
+  persists onto the matching governance-approvals row and is readable back via the admin API and
+  the Observability Hub run trace. Still fire-and-forget from the *caller's* point of view (the
+  `202` response never confirms the write succeeded), just no longer log-only server-side.
 
 ---
 

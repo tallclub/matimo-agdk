@@ -25,6 +25,11 @@ from matimo_agdk.adapters.langchain import (
     govern_tools,  # enforcement: policy-checks each tool call before it runs
 )
 
+# 3. Typed exception: a policy DENY on the LLM call itself (e.g. a model
+#    allow/deny-list rule) raises this, not the LLM SDK's own unstructured
+#    error -- see gateway_chat_model()'s own docstring.
+from matimo_agdk.exceptions import PolicyDenied
+
 
 @tool
 def calculator(expression: str) -> str:
@@ -52,7 +57,14 @@ def main() -> None:
 
         # Matimo: groups every span below under one run in the Gateway UI.
         with governor.run("langchain-demo-run"):
-            response = model.invoke(question, config={"callbacks": [handler]})
+            try:
+                response = model.invoke(question, config={"callbacks": [handler]})
+            except PolicyDenied as exc:
+                # Matimo: a denied LLM call -- print the reason and stop
+                # gracefully instead of letting a raw SDK traceback crash
+                # the agent. Retrying this exact call will simply recur.
+                print(f"Model call denied by Matimo Gateway: {exc.reason}")
+                return
             print(f"Model response: {response.content!r}")
             if response.tool_calls:
                 call = response.tool_calls[0]

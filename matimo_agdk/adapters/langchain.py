@@ -940,6 +940,18 @@ def gateway_chat_model(
     """Returns a `ChatOpenAI` (provider="openai", default) or
     `ChatAnthropic` (provider="anthropic") already pointed at Gateway.
 
+    A denied call (Gateway policy DENY, emergency stop, agent suspended/
+    revoked, telemetry staleness, or a missing/invalid signature) raises
+    this SDK's own typed exception -- `PolicyDenied` (or its `AgentSuspended`/
+    `TelemetryStale` subtypes) / `SignatureRejected` -- from
+    `governor.httpx_client()`'s transport (F38-agdk, 2026-09-27), the same
+    graceful-failure story `govern_tools()` already gives a denied tool
+    call. Before this, the underlying LLM SDK (openai-python, confirmed
+    live) saw the raw 403 first and wrapped it in its own unstructured
+    exception (`openai.PermissionDeniedError`, no `.reason`), so catch
+    `matimo_agdk.exceptions.PolicyDenied` here, not the LLM SDK's own
+    exception type, to react to *why* Gateway denied the call.
+
     `provider="openai"` -> full support for synchronous calls: the session
     token *and* a fresh `Matimo-Agent-Signature` are attached per request, via
     `governor.httpx_client()`'s request event hook (`ChatOpenAI.http_client`

@@ -12,6 +12,7 @@ from matimo_agdk.exceptions import (
     RateLimited,
     SessionExpired,
     SignatureRejected,
+    SpendCapExceeded,
     TelemetryStale,
 )
 from matimo_agdk.identity import JWSSigner
@@ -107,6 +108,31 @@ def test_policy_denied_carries_reason_in_message() -> None:
     with pytest.raises(PolicyDenied) as excinfo:
         http.request("POST", "/chat/completions", json_body={})
     assert excinfo.value.reason == "monthly_budget_exceeded"
+
+
+@respx.mock
+def test_spend_cap_exceeded_is_distinct_from_policy_denied() -> None:
+    """BUILD-PLAN 2026-09-25/26 unified budget ledger: a budget-exhausted
+    call is its own error code, `spend_cap_exceeded`, not `policy_denied` --
+    it must not be swallowed by the generic >=400 fallback branch."""
+    respx.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=httpx.Response(
+            403,
+            json={
+                "error": "spend_cap_exceeded",
+                "message": (
+                    "LLM budget reached for your team and agent. Ask an admin to raise it, "
+                    "or request more budget via POST /api/v1/budgets/requests."
+                ),
+            },
+        )
+    )
+    http = make_http()
+    with pytest.raises(SpendCapExceeded) as excinfo:
+        http.request("POST", "/chat/completions", json_body={})
+    assert excinfo.value.code == "spend_cap_exceeded"
+    assert "budget" in excinfo.value.message.lower()
+    assert not isinstance(excinfo.value, PolicyDenied)
 
 
 @respx.mock

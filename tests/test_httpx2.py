@@ -19,6 +19,7 @@ import respx
 
 from matimo_agdk import _compat
 from matimo_agdk._compat import sdk_requires_httpx2
+from matimo_agdk.exceptions import PolicyDenied
 from matimo_agdk.identity import IdentityCredentials, verify_jws
 
 from .adapters.conftest import bound_async_governor, bound_governor
@@ -134,6 +135,26 @@ def test_httpx2_client_rehandshakes_once_on_session_expired_and_resigns(
     # The retry carries its own fresh signature (new nonce), not the first request's.
     first, second = (verify_jws(h["Matimo-Agent-Signature"], keypair[1].encode()) for h in seen)
     assert first["nonce"] != second["nonce"]
+
+
+@respx.mock
+def test_httpx2_client_raises_policy_denied_on_403(
+    identity: IdentityCredentials, credentials_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F38-agdk (2026-09-27) httpx2 counterpart of the plain-httpx tests in
+    test_governor.py -- same Httpx2SessionRetryTransport codepath a raw
+    `anthropic.Anthropic(http_client=governor.anthropic_http_client())` call
+    goes through."""
+    _sessions("sess-1")
+
+    def handler(request: Any) -> Any:
+        return httpx2.Response(403, json={"error": "policy_denied", "message": "Deny gpt-4 model"})
+
+    _patch_transport(monkeypatch, handler)
+    governor = bound_governor(identity, credentials_dir)
+    with pytest.raises(PolicyDenied) as exc_info:
+        governor.httpx2_client().post("/chat/completions", content=b'{"model":"gpt-4"}')
+    assert exc_info.value.reason == "Deny gpt-4 model"
 
 
 @respx.mock

@@ -21,6 +21,7 @@ import httpx2
 from ._retry_transport import (
     SESSION_TOKEN_HEADER,
     _is_session_expired_body,
+    _raise_typed_error_for_403,
     _resign,
 )
 
@@ -54,6 +55,10 @@ class Httpx2SessionRetryTransport(httpx2.BaseTransport):
 
     def handle_request(self, request: httpx2.Request) -> httpx2.Response:
         response = self._inner.handle_request(request)
+        if response.status_code == 403:
+            response.read()  # safe: only ever done for a (small) error body
+            response.close()
+            _raise_typed_error_for_403(response)
         if response.status_code != 401:
             return response
         response.read()  # safe: only ever done for a (small) 401 error body
@@ -88,6 +93,10 @@ class Httpx2AsyncSessionRetryTransport(httpx2.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
         response = await self._inner.handle_async_request(request)
+        if response.status_code == 403:
+            await response.aread()  # safe: only ever done for a (small) error body
+            await response.aclose()
+            _raise_typed_error_for_403(response)
         if response.status_code != 401:
             return response
         await response.aread()  # safe: only ever done for a (small) 401 error body

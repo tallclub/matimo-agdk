@@ -10,8 +10,41 @@ string from the "error" field, .message is the optional human string from
 
 from __future__ import annotations
 
+# GatewayError also inherits from openai.OpenAIError / anthropic.AnthropicError
+# (whichever is installed) -- both SDKs' own request() methods special-case
+# "is this already one of our own exception types?" and re-raise it completely
+# untouched; anything else gets wrapped into a generic APIConnectionError,
+# destroying the original PolicyDenied/AgentSuspended/etc. type and message
+# (openai._base_client.request(): "except OpenAIError as err: raise err" vs.
+# "except Exception as err: raise APIConnectionError(...) from err";
+# anthropic._base_client.py has the identical "isinstance(err, AnthropicError)"
+# check). Without this, a 403 raised from matimo_agdk's own httpx transport
+# (see _retry_transport.py) still reaches the caller as a bare
+# openai.APIConnectionError / anthropic.APIConnectionError, one level below
+# where the transport raised it -- exactly the bug this base class exists to
+# close. Deliberately the *base* OpenAIError/AnthropicError, never the more
+# specific APIError (which requires request/body/response constructor args
+# these exceptions don't carry). Both imports are optional and best-effort:
+# matimo_agdk itself has no hard dependency on either provider SDK.
+_OpenAIError: type[Exception] | None
+_AnthropicError: type[Exception] | None
 
-class GatewayError(Exception):
+try:
+    from openai import OpenAIError as _OpenAIError
+except ImportError:  # pragma: no cover - openai not installed
+    _OpenAIError = None
+
+try:
+    from anthropic import AnthropicError as _AnthropicError
+except ImportError:  # pragma: no cover - anthropic not installed
+    _AnthropicError = None
+
+_LLM_SDK_BASES: tuple[type[Exception], ...] = tuple(
+    base for base in (_OpenAIError, _AnthropicError) if base is not None
+)
+
+
+class GatewayError(*(_LLM_SDK_BASES or (Exception,))):  # type: ignore[misc]
     """Base class for every error matimo_agdk's transport layer raises."""
 
     def __init__(
@@ -74,6 +107,29 @@ class SignatureRejected(GatewayError):
     missing, malformed, or failed verification. The server never says
     which of the many possible reasons applied (docs/SERVER-CONTRACT.md
     section 5.1)."""
+
+
+class SpendCapExceeded(GatewayError):
+    """403 spend_cap_exceeded. A tenant/team/user/virtual-key/agent-identity
+    LLM budget (BUILD-PLAN 2026-09-25/26 unified budget ledger) was already
+    at or over its cap when the call was reserved -- the call was never
+    dispatched to the LLM provider, no cost was incurred. Unlike
+    `PolicyDenied`, the server names no machine-readable scope in the
+    response body; `.message` is a human sentence naming which scope(s)
+    blocked the call (`GatewayProxyService.describeBudgetBlock()`) and
+    points at `POST /api/v1/budgets/requests` for a human to ask for more.
+    Retrying immediately will simply recur until an admin raises the cap or
+    the scope's reset period rolls over -- do not loop on it.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = 403,
+        code: str | None = "spend_cap_exceeded",
+    ) -> None:
+        super().__init__(message, status_code=status_code, code=code)
 
 
 class RateLimited(GatewayError):

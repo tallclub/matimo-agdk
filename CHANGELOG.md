@@ -6,6 +6,109 @@ All notable changes to this project are documented in this file.
 
 Initial core SDK build. Not yet published to PyPI.
 
+### Fixed (2026-09-27, a denied LLM call now raises a typed exception, not the raw SDK error)
+
+- **`_retry_transport.py`/`_retry_transport_httpx2.py`** (`SessionRetryTransport`/
+  `AsyncSessionRetryTransport`/`Httpx2SessionRetryTransport`/
+  `Httpx2AsyncSessionRetryTransport`) now raise the matching typed exception
+  (`PolicyDenied`, or its `AgentSuspended`/`TelemetryStale` subtypes, or
+  `SignatureRejected`) directly from the transport on a 403, reusing
+  `raise_for_error()` — the same flat-envelope-to-typed-exception mapping
+  every other Governor-owned call already gets via `GatewayHTTP.request()`.
+  Found live: `governor.httpx_client()` (what `gateway_chat_model()` hands
+  an LLM SDK as its own `http_client`) previously let a denied
+  `/v1/chat/completions`/`/v1/messages` call reach the LLM SDK as a bare 403
+  response, so openai-python wrapped it in its own unstructured
+  `PermissionDeniedError` (no `.reason`/`.code`) — the opposite of the
+  graceful `ToolDenied` a governed tool call already raises on the same
+  kind of denial. Deliberately scoped to 403 only, never 429/5xx: the
+  OpenAI/Anthropic SDKs already retry those by default (`max_retries`), and
+  intercepting them here would raise on the first attempt and silently
+  defeat that.
+- `gateway_chat_model()`'s docstring and `examples/langchain_agent.py` now
+  document/demonstrate catching `matimo_agdk.exceptions.PolicyDenied`
+  around the LLM call, not the LLM SDK's own exception type.
+- New tests: `tests/test_governor.py` (sync `httpx_client()`, all three 403
+  reason shapes plus a 429 pass-through regression guard),
+  `tests/test_transport_review.py` (async), `tests/test_httpx2.py` (the
+  Anthropic/httpx2 path). 548 passed, 1 skipped (was 542 passed, 1 skipped).
+- **Follow-up, same day**: raising the typed exception from the transport
+  turned out to be necessary but not sufficient. Live-tested against a real
+  denied call and found `openai-python`'s own `_base_client.request()` (and
+  `anthropic-python`'s equivalent) catches *any* exception surfacing from the
+  underlying httpx client and re-wraps it into a generic
+  `openai.APIConnectionError`/`anthropic.APIConnectionError` — *unless* it's
+  already an instance of that SDK's own base error type (`openai.OpenAIError`
+  / `anthropic.AnthropicError`), which both SDKs special-case to re-raise
+  untouched. `matimo_agdk.exceptions.GatewayError` (base of `PolicyDenied`
+  and every other typed exception) now conditionally inherits from whichever
+  of those two is installed, resolved at import time via a best-effort
+  `try/except ImportError` (matimo_agdk has no hard dependency on either
+  provider SDK) — deliberately the *base* `OpenAIError`/`AnthropicError`,
+  never the more specific `APIError` (which requires `request`/`body`/
+  `response` constructor args these exceptions don't carry, and would let a
+  caller's own broad `except openai.APIError` swallow a policy denial as if
+  it were a provider error). New test in `tests/test_governor.py` asserts the
+  isinstance relationship directly rather than re-deriving it through a live
+  SDK call. 551 passed, 1 skipped.
+
+### Added (2026-09-27, catch-up against Gateway's M8 budget/health/virtual-key work)
+
+Gateway (`Universal-AgentForge`, `feature/gateway`) shipped a run of features
+between 2026-09-19 and 2026-09-26 that this SDK had not yet reconciled
+against: `GET /v1/health`, a unified tenant/team/user/virtual-key/agent-identity
+LLM budget ledger, self-serve virtual keys, model aliases/load-balanced
+deployment groups, and a tool-argument allow-list on the Policy Engine. Most
+of that surface is either already-implemented (`check_health()` landed in the
+2026-09-22 commit below) or transparent to this SDK by design (virtual keys
+are just another bearer string; alias/group resolution and the argument
+allow-list are both server-side routing/policy decisions this SDK never has
+to know about — a DENY from either still surfaces as a normal `PolicyDenied`
+with a descriptive `reason`). Two real gaps closed in this pass:
+
+- **New `matimo_agdk.exceptions.SpendCapExceeded`** (`code="spend_cap_exceeded"`,
+  `status_code=403`), mapped in `transport.raise_for_error()`. Previously a
+  budget-exhausted call surfaced as a bare generic `GatewayError` —
+  distinguishable only by string-comparing `.code`, unlike every other
+  documented `403` (`PolicyDenied`, `SignatureRejected`, ...), which already
+  gets its own typed exception. Also flows through the 2026-09-27
+  `httpx_client()` 403-interception fix above, so a budget-denied
+  `gateway_chat_model()` call raises this instead of the LLM SDK's own
+  unstructured error too.
+- **`matimo-agdk doctor` now calls `GET /v1/health` first** (`Governor.check_health()`,
+  already existed, just wasn't used by the CLI), before the
+  identity-requiring checks below it — catches a bad API key or an inactive
+  Matimo Enterprise license immediately, matching the exact motivation
+  `GET /v1/health` was built for (see its docstring: replacing the old
+  register-a-throwaway-identity preflight this SDK's own `scripts/live_check.py`
+  used to do).
+- **`docs/SERVER-CONTRACT.md`** had several claims that went stale as Gateway
+  shipped past 2026-09-20 (when it was last fully reconciled): "no
+  `GET /v1/health` endpoint" (now exists, new §3.7), "`spend_cap_exceeded`
+  has no message field" (it does, since 2026-09-26, and is now distinguished
+  from the older identity-only `monthly_budget_exceeded` policy-denied
+  reason), "`POST /v1/tools/result` persists nothing queryable" (it does,
+  since 2026-09-22, BUILD-PLAN F35), and `X-Matimo-Run-Id` was documented
+  only for the LLM proxy routes, not `/v1/tools/check` (also accepted since
+  2026-09-22, F36 — this SDK already sent it, the doc just hadn't caught up).
+  Added a short virtual-key subsection to §2 since `/v1/tools/check` can now
+  be authenticated by one (2026-09-26).
+- New tests: `tests/test_transport.py::test_spend_cap_exceeded_is_distinct_from_policy_denied`,
+  `tests/test_cli_commands.py::test_cmd_doctor_passes_end_to_end` (updated to
+  mock `GET /v1/health`) and a new
+  `test_cmd_doctor_fails_fast_on_bad_health_check`.
+- Confirmed already fine, no code change needed: `F26` (heartbeat
+  `configVersion`) is surfaced end-to-end — `matimo-agdk status` already
+  prints it. `F34` (control-stream push) and `F36` (tool-check `run_id`
+  correlation) client code is already committed on this branch (2026-09-22).
+  `F30` (Anthropic guardrail blocks now return `stop_reason: "end_turn"` +
+  a `matimo` extension field) needed nothing here — this SDK never parses
+  LLM response bodies, that's the calling application's own SDK client, and
+  no adapter branches on `finish_reason`/`stop_reason` for control flow,
+  only records it as a passive telemetry attribute. `08f31b71`/`e5bf9ae1`'s
+  budget-request/admin routes (`/api/v1/budgets/*`) are session-JWT, human-
+  facing admin endpoints, not part of this SDK's `/v1` surface.
+
 ### Fixed (2026-09-22, tool checks now carry X-Matimo-Run-Id)
 
 - **`ToolGovernor`/`AsyncToolGovernor`** (`matimo_agdk/tools.py`) now attach the

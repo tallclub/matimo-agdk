@@ -111,6 +111,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("  [ok] org API key present")
 
     governor = Governor(config)
+
+    # GET /v1/health (QUALITY-REVIEW item 11) needs only the org API key --
+    # no identity, no session -- so it can catch a bad key or an inactive
+    # Matimo Enterprise license before the identity check below even runs.
+    try:
+        health = governor.check_health()
+        license_info = health.get("license", {})
+        print(f"  [ok] Gateway reachable, license active (mode={license_info.get('mode')})")
+    except GatewayError as exc:
+        print(f"  [FAIL] GET /v1/health failed: {exc.message}")
+        return 1
+
     if governor.identity is None:
         print("  [FAIL] no identity found -- run `matimo-agdk register` first")
         return 1

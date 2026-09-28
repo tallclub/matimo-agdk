@@ -18,6 +18,7 @@ import respx
 
 from matimo_agdk._retry_transport import AsyncSessionRetryTransport
 from matimo_agdk.config import GatewayConfig
+from matimo_agdk.exceptions import PolicyDenied
 from matimo_agdk.identity import IdentityCredentials, JWSSigner, save_credentials
 from matimo_agdk.transport import GatewayHTTP, RetryPolicy
 
@@ -91,6 +92,29 @@ async def test_async_session_retry_transport_resends_once(identity: IdentityCred
     assert resp.status_code == 200
     assert inner.seen == ["stale", "tok-1"]
     assert session.invalidations == 1
+
+
+class _FakeInner403(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": "policy_denied", "message": "Deny gpt-4 model"})
+
+
+async def test_async_session_retry_transport_raises_policy_denied_on_403(
+    identity: IdentityCredentials,
+) -> None:
+    """F38-agdk (2026-09-27) async counterpart of the sync test in
+    test_governor.py -- see AsyncSessionRetryTransport.handle_async_request's
+    doc comment (via SessionRetryTransport's, in _retry_transport.py)."""
+    transport = AsyncSessionRetryTransport(
+        _FakeInner403(),
+        _FakeAsyncSession(),
+        JWSSigner.from_credentials(identity),
+        signing_enabled=True,  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as client:
+        with pytest.raises(PolicyDenied) as exc_info:
+            await client.post("/chat/completions", json={"model": "gpt-4"})
+    assert exc_info.value.reason == "Deny gpt-4 model"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes only")
