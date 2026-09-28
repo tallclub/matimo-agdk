@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import random
+import socket
 import threading
 import time
 from collections.abc import Callable
@@ -231,6 +232,26 @@ class _Policy:
         return attempt + 1
 
 
+def _shutdown_response_socket(response: httpx.Response) -> None:
+    """Best-effort `SHUT_RDWR` on a streaming response's underlying socket.
+
+    httpx doesn't expose this, so it's reached through the `network_stream`
+    extension httpcore attaches to the response; any failure (older httpx, a
+    non-socket transport, a socket already gone) is swallowed -- the caller's
+    `response.close()` is still the primary shutdown path everywhere shutdown()
+    isn't needed or available.
+    """
+    try:
+        network_stream = response.extensions.get("network_stream")
+        if network_stream is None:
+            return
+        sock = network_stream.get_extra_info("socket")
+        if isinstance(sock, socket.socket):
+            sock.shutdown(socket.SHUT_RDWR)
+    except Exception:  # noqa: BLE001 -- best-effort only
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Sync consumer (a daemon thread)
 # ---------------------------------------------------------------------------
@@ -277,6 +298,12 @@ class ControlStreamConsumer:
         self._stop.set()
         response = self._response
         if response is not None:
+            # On an idle stream the reader thread is parked in a blocking socket
+            # recv(); response.close() alone doesn't wake it on Linux (unlike
+            # Windows/macOS), since POSIX close() from another thread doesn't
+            # interrupt a concurrent blocking read on the same fd. shutdown()
+            # does, so it runs first.
+            _shutdown_response_socket(response)
             try:
                 response.close()  # unblocks a reader parked in iter_lines()
             except Exception:  # noqa: BLE001 -- already closing; nothing to salvage

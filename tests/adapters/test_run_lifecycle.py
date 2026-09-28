@@ -22,7 +22,6 @@ import httpx
 import pytest
 from autogen_core import CancellationToken
 from autogen_core.tools import FunctionTool
-from crewai.tools import BaseTool as CrewBaseTool
 from langchain_core.tools import ToolException, tool
 from pydantic import BaseModel
 
@@ -178,7 +177,10 @@ class _Args(BaseModel):
     x: int
 
 
-def _crew_tool() -> CrewBaseTool:
+def _crew_tool() -> Any:
+    pytest.importorskip("crewai")
+    from crewai.tools import BaseTool as CrewBaseTool
+
     class MyTool(CrewBaseTool):
         name: str = "mytool"
         description: str = "test"
@@ -192,6 +194,7 @@ def _crew_tool() -> CrewBaseTool:
 
 @scenario
 async def _crewai_govern_tool() -> Governor:
+    pytest.importorskip("crewai")
     from matimo_agdk.adapters.crewai import govern_tool
 
     gov = _governor()
@@ -201,6 +204,7 @@ async def _crewai_govern_tool() -> Governor:
 
 @scenario
 async def _crewai_govern_tool_denied() -> Governor:
+    pytest.importorskip("crewai")
     from matimo_agdk.adapters.crewai import govern_tool
 
     gov = _governor("DENY")
@@ -211,6 +215,7 @@ async def _crewai_govern_tool_denied() -> Governor:
 
 @scenario
 async def _crewai_llm_interceptor() -> Governor:
+    pytest.importorskip("crewai")
     from matimo_agdk.adapters.crewai import make_interceptor
 
     gov = _governor()
