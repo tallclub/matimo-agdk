@@ -29,6 +29,11 @@ same graceful-recovery shape LangChain's `handle_tool_error` provides),
 rather than crashing the whole crew run. `mode="observe"` only records tool
 spans, never calls `check_tool()`.
 
+A Gateway outage that leaves a tool check unanswered (fail-closed) raises
+`ToolCheckUnavailable` from the same place, and is surfaced to the agent the same
+way. With `tool_check_failure_mode="fail_open_bounded"` the tool may run instead,
+and its span is marked `matimo.degraded_mode`.
+
 Rapid suspend (`mode="govern"` only): `governor.raise_if_suspended()` is
 called before each wrapped tool's real body runs.
 
@@ -47,30 +52,33 @@ cost of no token-usage enrichment for a streamed call).
 ADK's invocation_id, CrewAI exposes no natural per-`kickoff()` id this
 interceptor or `govern_tool()`'s tool wrapper can see. Every span here (LLM
 and tool alike) uses the ambient `governor.run()` id when one is active,
-and otherwise falls back to a fresh, uncorrelated id per call -- the same
-fallback `emit_llm_span()`/`emit_tool_span()` use everywhere in this SDK.
-**Wrap `crew.kickoff()` in `with governor.run("my-crew-run"):`** to get one
-correlated run per crew execution in the Gateway Observability Hub;
-without it, every LLM call and every tool call in the crew shows up as its
-own separate, uncorrelated entry.
+and otherwise gives each call a one-span run of its own, opened and closed
+around it -- the same fallback `emit_llm_span()`/`emit_tool_span()` use
+everywhere in this SDK. **Wrap `crew.kickoff()` in
+`with governor.run("my-crew-run"):`** to get one correlated run per crew
+execution in the Gateway Observability Hub; without it, every LLM call and
+every tool call in the crew shows up as its own separate, uncorrelated
+(but completed, not stuck `running`) run.
 """
 
 from __future__ import annotations
 
 import functools
-import inspect
 import json
 import time
 from contextvars import ContextVar
 from typing import Any
 
+from .._outage import degraded_attributes
 from ..exceptions import ToolDenied
+from ..transport import parse_retry_after, raise_for_error
 from ._shared import (
     Mode,
     async_check_and_wait,
     async_raise_if_suspended,
     call_args_from,
     check_mode,
+    default_llm_headers,
     emit_llm_span,
     emit_tool_span,
     sync_check_and_wait,
@@ -136,23 +144,53 @@ def _usage_and_model_from_body(body: bytes) -> tuple[dict[str, Any], str | None]
     return attrs, (str(model) if model else None)
 
 
+def _raise_typed_gateway_error(response: Any, body_bytes: bytes | None) -> None:
+    """Raises this SDK's own typed exception (`PolicyDenied`, `RateLimited`,
+    ...) for a non-2xx Gateway response -- the same `raise_for_error()`
+    mapping Governor's own transport uses for every other Gateway call
+    (`_retry_transport.py`'s `_raise_typed_error_for_403`) -- so a denied LLM
+    call made through `gateway_llm()` raises exactly like a denied tool call
+    does, instead of CrewAI's own unstructured `openai.PermissionDeniedError`.
+    Always raises: `raise_for_error()`'s own final branch raises a generic
+    `GatewayError` even for a body it doesn't recognize.
+    """
+    body: Any = None
+    if body_bytes:
+        try:
+            body = json.loads(body_bytes)
+        except ValueError:
+            body = None
+    raise_for_error(
+        response.status_code,
+        body if isinstance(body, dict) else None,
+        parse_retry_after(response.headers.get("Retry-After")),
+    )
+
+
 def _wrap_sync_run(
     inner: Any, tool_name: str, governor: Any, mode: Mode, category: str | None
 ) -> Any:
     @functools.wraps(inner)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         call_args = call_args_from(args, kwargs)
+        decision = None
         if mode == "govern":
             sync_raise_if_suspended(governor)
+            # A ToolCheckUnavailable (Gateway unreachable, fail-closed) propagates like
+            # ToolDenied: CrewAI's ToolUsage turns either into an observation.
             decision = sync_check_and_wait(governor, tool_name, call_args, category=category)
             if decision.denied:
                 raise ToolDenied(decision.reason)
         started = _now()
         status = "completed"
+        span_result: Any = None
         try:
-            return inner(*args, **kwargs)
-        except Exception:
+            result = inner(*args, **kwargs)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             emit_tool_span(
@@ -161,6 +199,8 @@ def _wrap_sync_run(
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
                 arguments=call_args,
+                result=span_result,
+                attributes=degraded_attributes(decision),
             )
 
     return wrapper
@@ -172,6 +212,7 @@ def _wrap_async_run(
     @functools.wraps(inner)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         call_args = call_args_from(args, kwargs)
+        decision = None
         if mode == "govern":
             await async_raise_if_suspended(governor)
             decision = await async_check_and_wait(governor, tool_name, call_args, category=category)
@@ -179,10 +220,14 @@ def _wrap_async_run(
                 raise ToolDenied(decision.reason)
         started = _now()
         status = "completed"
+        span_result: Any = None
         try:
-            return await inner(*args, **kwargs)
-        except Exception:
+            result = await inner(*args, **kwargs)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             emit_tool_span(
@@ -191,6 +236,8 @@ def _wrap_async_run(
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
                 arguments=call_args,
+                result=span_result,
+                attributes=degraded_attributes(decision),
             )
 
     return wrapper
@@ -210,9 +257,12 @@ def govern_tool(
     if base_run is not None:
         tool._run = _wrap_sync_run(base_run, name, governor, mode, category)  # noqa: SLF001
 
-    overrides_arun = "_arun" in type(tool).__dict__ or any(
-        "_arun" in base.__dict__ for base in type(tool).__mro__[1:-1]
-    )
+    # CrewAI's default `_arun` just raises NotImplementedError. Wrapping it would
+    # run a policy check (and possibly open a human-approval request) for a call
+    # that can never execute, so only a real override is wrapped.
+    from crewai.tools import BaseTool as CrewBaseTool
+
+    overrides_arun = getattr(type(tool), "_arun", None) is not CrewBaseTool._arun
     base_arun = getattr(tool, "_arun", None)
     if overrides_arun and base_arun is not None:
         tool._arun = _wrap_async_run(base_arun, name, governor, mode, category)  # noqa: SLF001
@@ -284,21 +334,24 @@ def gateway_llm(governor: Any, *, model: str | None = None, **kwargs: Any) -> An
     `requireSignedRequests=true`. The same interceptor also emits an LLM
     span per call -- see this module's docstring, "LLM spans and gen_ai.*
     attributes". `additional_params.extra_headers` stays as a static
-    fallback and is the only mechanism used with an `AsyncGovernor` (its
-    header computation is a coroutine, which CrewAI's sync interceptor
-    cannot await) -- **no interceptor is installed at all in that case, so
-    an `AsyncGovernor`-backed `gateway_llm()` gets neither live headers nor
-    LLM spans**, only the tool spans `govern_tool()`/`govern_crew()`
-    already record independently. Session expiry is not retried here; the
-    default session TTL is one hour.
+    fallback. Needs a sync `Governor` (an `AsyncGovernor` raises a clear
+    `TypeError`: its session handshake must be awaited, and this builder is
+    synchronous); a sync `Governor` still serves async CrewAI code. Session
+    expiry is not retried here; the default session TTL is one hour.
+
+    **A denied call raises `PolicyDenied`, like every other adapter.**
+    `MatimoInterceptor.on_inbound()`/`aon_inbound()` see the raw Gateway
+    response before CrewAI's own OpenAI SDK call does (same extension point
+    `_retry_transport.py` uses for the httpx-client-wired adapters), and
+    raise this SDK's own typed exception directly on a non-2xx response
+    (`_raise_typed_gateway_error()`) instead of letting CrewAI build its own
+    unstructured `openai.PermissionDeniedError` from it.
     """
-    headers = governor.openai_client_kwargs()["default_headers"]
+    headers = default_llm_headers(governor, "gateway_llm")
     model_name = model or "matimo/auto"
     from crewai import LLM
 
-    interceptor = None
-    if not inspect.iscoroutinefunction(getattr(governor, "request_headers", None)):
-        interceptor = make_interceptor(governor)
+    interceptor = make_interceptor(governor)
 
     return LLM(  # type: ignore[call-arg]
         # `custom_openai` is a real, working kwarg at runtime -- it is
@@ -345,10 +398,15 @@ def make_interceptor(governor: Any) -> Any:
             started, request_model = _PENDING_LLM_CALL.get() or (_now(), None)
             attrs: dict[str, Any] = {}
             response_model = None
-            if "text/event-stream" not in message.headers.get("content-type", ""):
+            body_bytes: bytes | None = None
+            if not message.is_success or "text/event-stream" not in message.headers.get(
+                "content-type", ""
+            ):
                 try:
                     message.read()
-                    attrs, response_model = _usage_and_model_from_body(message.content)
+                    body_bytes = message.content
+                    if message.is_success:
+                        attrs, response_model = _usage_and_model_from_body(body_bytes)
                 except Exception:  # noqa: BLE001 -- telemetry must never break the real call
                     pass
             emit_llm_span(
@@ -359,6 +417,11 @@ def make_interceptor(governor: Any) -> Any:
                 duration_ms=int((_now() - started) * 1000),
                 attributes=attrs or None,
             )
+            if not message.is_success:
+                # Raised from the transport, before CrewAI's own OpenAI SDK
+                # call sees the response -- see _raise_typed_gateway_error()'s
+                # own docstring for why this must happen here.
+                _raise_typed_gateway_error(message, body_bytes)
             return message
 
         async def aon_outbound(self, message: httpx.Request) -> httpx.Request:
@@ -368,10 +431,15 @@ def make_interceptor(governor: Any) -> Any:
             started, request_model = _PENDING_LLM_CALL.get() or (_now(), None)
             attrs: dict[str, Any] = {}
             response_model = None
-            if "text/event-stream" not in message.headers.get("content-type", ""):
+            body_bytes: bytes | None = None
+            if not message.is_success or "text/event-stream" not in message.headers.get(
+                "content-type", ""
+            ):
                 try:
                     await message.aread()
-                    attrs, response_model = _usage_and_model_from_body(message.content)
+                    body_bytes = message.content
+                    if message.is_success:
+                        attrs, response_model = _usage_and_model_from_body(body_bytes)
                 except Exception:  # noqa: BLE001
                     pass
             emit_llm_span(
@@ -382,6 +450,8 @@ def make_interceptor(governor: Any) -> Any:
                 duration_ms=int((_now() - started) * 1000),
                 attributes=attrs or None,
             )
+            if not message.is_success:
+                _raise_typed_gateway_error(message, body_bytes)
             return message
 
     return MatimoInterceptor()

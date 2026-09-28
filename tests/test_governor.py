@@ -5,9 +5,16 @@ import pytest
 import respx
 
 from matimo_agdk.config import GatewayConfig
-from matimo_agdk.exceptions import GatewayError, ToolDenied
+from matimo_agdk.exceptions import (
+    AgentSuspended,
+    GatewayError,
+    PolicyDenied,
+    SignatureRejected,
+    ToolDenied,
+)
 from matimo_agdk.governor import Governor
 from matimo_agdk.identity import IdentityCredentials, load_credentials
+from matimo_agdk.tools import NO_RESUME_TOKEN_DENY_REASON
 
 from .conftest import BASE_URL, future_iso
 
@@ -230,6 +237,50 @@ def test_guard_pending_then_approved_runs_function(
         governor.stop()
 
 
+@respx.mock
+def test_guard_tokenless_pending_denies_and_never_runs_the_function(
+    identity: IdentityCredentials, credentials_dir
+) -> None:
+    """Gateway can answer PENDING with no resumeToken (an identical check is
+    already in flight). guard() used to treat that as "not denied" and run
+    the tool without the approval a policy demanded."""
+    respx.post(f"{BASE_URL}/sessions").mock(
+        return_value=httpx.Response(
+            201,
+            json={
+                "data": {"sessionToken": "tok", "expiresAt": future_iso(3600), "identityId": "x"}
+            },
+        )
+    )
+    check_route = respx.post(f"{BASE_URL}/tools/check").mock(
+        return_value=httpx.Response(
+            200, json={"data": {"decision": "PENDING", "reason": "duplicate_check_in_flight"}}
+        )
+    )
+    respx.post(f"{BASE_URL}/telemetry/batch").mock(
+        return_value=httpx.Response(200, json={"data": {"accepted": 0, "failed": []}})
+    )
+
+    governor = Governor(bound_config(identity, credentials_dir))
+    governor.start()
+    try:
+        governor._tools.recheck_delays = (0.0, 0.0)  # noqa: SLF001
+        ran: list[str] = []
+
+        def send_email(to: str) -> str:
+            ran.append(to)
+            return f"sent to {to}"
+
+        with governor.run("test-run"):
+            with pytest.raises(ToolDenied) as excinfo:
+                governor.guard(send_email, name="send_email")(to="a@example.com")
+        assert excinfo.value.reason == NO_RESUME_TOKEN_DENY_REASON
+        assert ran == []
+        assert check_route.call_count == 3  # first check + two rechecks
+    finally:
+        governor.stop()
+
+
 def test_guard_without_identity_raises() -> None:
     config = GatewayConfig(base_url=BASE_URL, api_key="key")
     governor = Governor(config)
@@ -334,6 +385,127 @@ def test_httpx_client_transparently_rehandshakes_on_session_expired(
     assert resp.status_code == 200
     assert resp.json() == {"id": "chatcmpl-1"}
     assert seen_session_headers == ["tok-first", "tok-second"]
+
+
+def _mock_sessions_and_chat(status_code: int, body: dict) -> None:
+    respx.post(f"{BASE_URL}/sessions").mock(
+        return_value=httpx.Response(
+            201,
+            json={
+                "data": {"sessionToken": "tok-1", "expiresAt": future_iso(3600), "identityId": "x"}
+            },
+        )
+    )
+    respx.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=httpx.Response(status_code, json=body)
+    )
+
+
+@respx.mock
+def test_httpx_client_raises_policy_denied_on_403_instead_of_returning_the_raw_response(
+    identity: IdentityCredentials, credentials_dir
+) -> None:
+    """F38-agdk (2026-09-27): before this, `governor.httpx_client()` handed
+    an LLM SDK (e.g. `gateway_chat_model()`'s ChatOpenAI) a Gateway policy
+    DENY as a bare 403 httpx.Response, so the SDK wrapped it in its OWN
+    unstructured exception (openai.PermissionDeniedError, confirmed live) --
+    unlike a governed tool call, which raises this SDK's own typed
+    `ToolDenied`. SessionRetryTransport now raises `PolicyDenied` directly
+    from the transport, before any LLM SDK ever sees the response."""
+    _mock_sessions_and_chat(403, {"error": "policy_denied", "message": "Deny gpt-4 model"})
+
+    config = bound_config(identity, credentials_dir)
+    governor = Governor(config)
+    client = governor.httpx_client()
+    try:
+        with pytest.raises(PolicyDenied) as exc_info:
+            client.post("/chat/completions", json={"model": "gpt-4", "messages": []})
+        assert exc_info.value.reason == "Deny gpt-4 model"
+        assert exc_info.value.code == "policy_denied"
+        assert exc_info.value.status_code == 403
+    finally:
+        client.close()
+
+
+@respx.mock
+def test_httpx_client_raises_agent_suspended_on_403_lifecycle_reason(
+    identity: IdentityCredentials, credentials_dir
+) -> None:
+    _mock_sessions_and_chat(403, {"error": "policy_denied", "message": "emergency_stop_active"})
+
+    config = bound_config(identity, credentials_dir)
+    governor = Governor(config)
+    client = governor.httpx_client()
+    try:
+        with pytest.raises(AgentSuspended):
+            client.post("/chat/completions", json={"model": "m", "messages": []})
+    finally:
+        client.close()
+
+
+@respx.mock
+def test_httpx_client_raises_signature_rejected_on_403_signature_required(
+    identity: IdentityCredentials, credentials_dir
+) -> None:
+    _mock_sessions_and_chat(403, {"error": "signature_required"})
+
+    config = bound_config(identity, credentials_dir)
+    governor = Governor(config)
+    client = governor.httpx_client()
+    try:
+        with pytest.raises(SignatureRejected):
+            client.post("/chat/completions", json={"model": "m", "messages": []})
+    finally:
+        client.close()
+
+
+@respx.mock
+def test_httpx_client_does_not_intercept_429_or_5xx_so_the_llm_sdks_own_retry_still_works(
+    identity: IdentityCredentials, credentials_dir
+) -> None:
+    """Deliberately NOT extended to 429/5xx (see _retry_transport.py's own
+    doc comment): the OpenAI/Anthropic SDK already retries those by default,
+    and raising here on the first attempt would silently defeat that."""
+    _mock_sessions_and_chat(429, {"error": "rate_limit_exceeded"})
+
+    config = bound_config(identity, credentials_dir)
+    governor = Governor(config)
+    client = governor.httpx_client()
+    try:
+        resp = client.post("/chat/completions", json={"model": "m", "messages": []})
+    finally:
+        client.close()
+
+    assert resp.status_code == 429
+
+
+def test_policy_denied_survives_openai_and_anthropic_sdks_own_exception_wrapping() -> None:
+    """Raising PolicyDenied from the transport (see the test above) is only
+    half the fix -- both openai-python's and anthropic-python's own
+    request() methods catch *any* exception coming out of the underlying
+    httpx client and re-wrap it into a generic APIConnectionError, UNLESS
+    it's already one of their own SDK exception types (openai:
+    `except OpenAIError as err: raise err`; anthropic:
+    `isinstance(err, AnthropicError): raise`). Without GatewayError also
+    inheriting from those, a user's `except PolicyDenied` in their own code
+    (e.g. examples/langchain_agent.py) would never fire -- they'd see a bare
+    openai.APIConnectionError / anthropic.APIConnectionError instead, one
+    level higher than where matimo_agdk raised it. This asserts the actual
+    isinstance relationship those SDKs branch on, not just that our own
+    transport raises the right type."""
+    import anthropic
+    import openai
+
+    exc = PolicyDenied("Deny gpt-4 model")
+
+    assert isinstance(exc, openai.OpenAIError)
+    assert isinstance(exc, anthropic.AnthropicError)
+    # Deliberately NOT openai.APIError / anthropic.APIError -- those require
+    # request/body/response constructor args PolicyDenied doesn't carry, and
+    # a broader `except openai.APIError`/`except anthropic.APIError` clause
+    # elsewhere in a caller's SDK version could otherwise swallow it.
+    assert not isinstance(exc, openai.APIError)
+    assert not isinstance(exc, anthropic.APIError)
 
 
 @respx.mock

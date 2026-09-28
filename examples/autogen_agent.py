@@ -16,8 +16,23 @@ from autogen_agentchat.messages import TextMessage
 from autogen_core import CancellationToken
 from autogen_core.tools import FunctionTool
 
+# --- Matimo AGDK imports (same three roles in every example) ---------------
+# 1. Governor: the core object. Holds this agent's registered identity, sends
+#    telemetry to Matimo Gateway, and answers "is this tool call allowed?".
+#    AutoGen is async-only, so this example uses AsyncGovernor -- the same
+#    thing as Governor, but with awaitable start()/stop()/run().
 from matimo_agdk import AsyncGovernor
-from matimo_agdk.adapters.autogen import gateway_model_client, govern_tools
+
+# 2. AutoGen adapter (matimo_agdk.adapters.autogen):
+from matimo_agdk.adapters.autogen import (
+    gateway_model_client,  # LLM routing: an OpenAIChatCompletionClient pointed at Matimo Gateway
+    govern_tools,  # enforcement: policy-checks each tool call before it runs
+)
+
+# 3. Typed exception: a policy DENY on the LLM call itself (e.g. a model
+#    allow/deny-list rule), an exhausted spend cap, or a rapid suspend all
+#    raise this common base, not the LLM SDK's own unstructured error.
+from matimo_agdk.exceptions import GatewayError
 
 
 def calculator(expression: str) -> str:
@@ -27,24 +42,38 @@ def calculator(expression: str) -> str:
 
 async def main() -> None:
     question = " ".join(sys.argv[1:]) or "What's 12 * 7?"
+    # Matimo: load the identity created by `matimo-agdk register` (plus the
+    # API key / Gateway URL from env vars), then start background telemetry.
     governor = AsyncGovernor.from_env(agent_name="autogen-demo")
     await governor.start()
 
     try:
         tool = FunctionTool(calculator, description="Evaluate an arithmetic expression.")
-        govern_tools([tool], governor)  # wraps tool.run() in place
+        # Matimo: wraps tool.run() in place; a policy DENY raises ToolDenied,
+        # which AutoGen feeds back to the model as an error tool result.
+        govern_tools([tool], governor)
 
         agent = AssistantAgent(
             name="calculator_agent",
+            # Matimo: the LLM call goes through Gateway, not straight to OpenAI.
             model_client=gateway_model_client(governor, model="gpt-4o-mini"),
             tools=[tool],
         )
+        # Matimo: groups every span below under one run in the Gateway UI.
         async with governor.run("autogen-demo-run"):
-            response = await agent.on_messages(
-                [TextMessage(content=question, source="user")], CancellationToken()
-            )
+            try:
+                response = await agent.on_messages(
+                    [TextMessage(content=question, source="user")], CancellationToken()
+                )
+            except GatewayError as exc:
+                # Matimo: a denied/blocked LLM call -- print the reason and
+                # stop gracefully instead of letting a raw SDK traceback
+                # crash the agent. Retrying this exact call will simply recur.
+                print(f"Matimo Gateway blocked this call: {exc}")
+                return
             print(response.chat_message.content)
     finally:
+        # Matimo: flush any queued telemetry and stop the background task.
         await governor.stop()
 
 

@@ -35,13 +35,18 @@ flattened or degraded one -- none).
 
 from __future__ import annotations
 
+import functools
+import inspect
 import time
 from typing import Any
 
+from .._outage import degraded_attributes
+from ..exceptions import ToolDenied
 from ._shared import (
     Mode,
     async_check_and_wait,
     async_raise_if_suspended,
+    call_args_from,
     check_mode,
     emit_tool_span,
     is_async_governor,
@@ -53,16 +58,18 @@ def _now() -> float:
 
 
 def _observe_sync(fn: Any, name: str, governor: Any) -> Any:
-    import functools
-
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         started = _now()
         status = "completed"
+        span_result: Any = None
         try:
-            return fn(*args, **kwargs)
-        except Exception:
+            result = fn(*args, **kwargs)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             emit_tool_span(
@@ -70,23 +77,26 @@ def _observe_sync(fn: Any, name: str, governor: Any) -> Any:
                 name,
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
-                arguments=kwargs or {f"arg{i}": v for i, v in enumerate(args)},
+                arguments=call_args_from(args, kwargs),
+                result=span_result,
             )
 
     return wrapper
 
 
 def _observe_async(fn: Any, name: str, governor: Any) -> Any:
-    import functools
-
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         started = _now()
         status = "completed"
+        span_result: Any = None
         try:
-            return await fn(*args, **kwargs)
-        except Exception:
+            result = await fn(*args, **kwargs)
+            span_result = result
+            return result
+        except Exception as exc:
             status = "error"
+            span_result = str(exc)
             raise
         finally:
             emit_tool_span(
@@ -94,7 +104,8 @@ def _observe_async(fn: Any, name: str, governor: Any) -> Any:
                 name,
                 status=status,
                 duration_ms=int((_now() - started) * 1000),
-                arguments=kwargs or {f"arg{i}": v for i, v in enumerate(args)},
+                arguments=call_args_from(args, kwargs),
+                result=span_result,
             )
 
     return wrapper
@@ -103,8 +114,19 @@ def _observe_async(fn: Any, name: str, governor: Any) -> Any:
 def _govern_one(
     fn: Any, governor: Any, *, mode: Mode, category: str | None, name: str | None
 ) -> Any:
-    import inspect
+    if getattr(fn, "_matimo_governed", False):
+        return fn  # govern() twice must not stack two checks on one call
+    governed = _govern_uncached(fn, governor, mode=mode, category=category, name=name)
+    try:
+        governed._matimo_governed = True
+    except Exception:  # noqa: BLE001 -- e.g. a callable that rejects attributes; harmless
+        pass
+    return governed
 
+
+def _govern_uncached(
+    fn: Any, governor: Any, *, mode: Mode, category: str | None, name: str | None
+) -> Any:
     tool_name = name or getattr(fn, "__name__", None) or "tool"
 
     if mode == "observe":
@@ -119,25 +141,28 @@ def _govern_one(
             # Bridge: run the sync Governor's blocking guard() logic (via
             # its own check_tool/await_decision) around the async callable
             # ourselves, since Governor.guard() only wraps sync callables.
-            import functools
-
             @functools.wraps(fn)
             async def bridged(*args: Any, **kwargs: Any) -> Any:
-                call_args = kwargs or {f"arg{i}": v for i, v in enumerate(args)}
+                # Positional AND keyword inputs: `kwargs or {...}` dropped the
+                # positionals whenever any keyword was present, so f(1, b=2)
+                # and f(99, b=2) hashed to one server-side dedup key.
+                call_args = call_args_from(args, kwargs)
                 await async_raise_if_suspended(governor)
                 decision = await async_check_and_wait(
                     governor, tool_name, call_args, category=category
                 )
-                from ..exceptions import ToolDenied
-
                 if decision.denied:
                     raise ToolDenied(decision.reason)
                 started = _now()
                 status = "completed"
+                span_result: Any = None
                 try:
-                    return await fn(*args, **kwargs)
-                except Exception:
+                    result = await fn(*args, **kwargs)
+                    span_result = result
+                    return result
+                except Exception as exc:
                     status = "error"
+                    span_result = str(exc)
                     raise
                 finally:
                     emit_tool_span(
@@ -146,6 +171,8 @@ def _govern_one(
                         status=status,
                         duration_ms=int((_now() - started) * 1000),
                         arguments=call_args,
+                        result=span_result,
+                        attributes=degraded_attributes(decision),
                     )
 
             return bridged

@@ -16,18 +16,22 @@ that accepts a custom base_url and http client.
 from __future__ import annotations
 
 import functools
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, TypeVar
 
 import httpx
 
+from ._compat import sdk_requires_httpx2
+from ._outage import OutageGuard, degraded_attributes
 from ._retry_transport import AsyncSessionRetryTransport, SessionRetryTransport
 from .config import GatewayConfig
+from .control_stream import AsyncControlStreamConsumer, ControlStreamConsumer
 from .exceptions import GatewayError, ToolDenied
 from .identity import IdentityCredentials, JWSSigner, credentials_paths, save_credentials
 from .session import SESSION_TOKEN_HEADER, AsyncSessionManager, SessionManager
@@ -44,6 +48,8 @@ from .transport import AsyncGatewayHTTP, GatewayHTTP
 
 R = TypeVar("R")
 
+_log = logging.getLogger("matimo_agdk.governor")
+
 RUN_ID_HEADER = "X-Matimo-Run-Id"
 
 # The active run id is context-local (asyncio task or thread), never an
@@ -59,10 +65,77 @@ def current_run_id() -> str | None:
 
 
 REGISTER_PATH = "/identities"
+# QUALITY-REVIEW item 11 (2026-09-22, UAF-side) -- a cheap, side-effect-free
+# status probe. See Governor.check_health()/AsyncGovernor.check_health().
+HEALTH_PATH = "/health"
+
+
+_HTTPX2_HINT = (
+    "This client needs the `httpx2` package (the HTTP library newer LLM SDKs such as "
+    "anthropic >= 1.6 are built on). It is installed with those SDKs; otherwise "
+    "`pip install httpx2`."
+)
+
+
+def _bind_hint(exc: ImportError) -> ImportError:
+    return ImportError(f"{_HTTPX2_HINT} ({exc})")
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
+
+
+def _raise_pending_telemetry_error(governor: Any) -> None:
+    """Under fail_open_telemetry=False, raise the exporter's stored flush
+    error now. guard() calls this before it checks or runs anything, so a
+    broken telemetry pipe fails the call closed with no side effects rather
+    than after the tool has already acted. A no-op when fail-open or clean."""
+    telemetry = governor._telemetry
+    if telemetry is not None:
+        telemetry._raise_pending()
+
+
+def _record_tool_span(governor: Any, tool_name: str, **kwargs: Any) -> None:
+    """tool_span() for a tool call that has already been decided or has run.
+
+    With fail_open_telemetry=False, tool_span() raises the exporter's stored
+    flush error, and submit() raises before enqueueing, so the span is lost
+    too. That error must not replace the tool's return value or its own
+    exception: it is logged, and the span is recorded once more (the raise
+    consumed the stored error, so the retry goes through). guard() refuses
+    *before* the tool runs instead -- see `_raise_pending_telemetry_error()`.
+    """
+    try:
+        governor.tool_span(tool_name, **kwargs)
+    except GatewayError as exc:
+        _log.warning("telemetry error after tool %r had already run: %s", tool_name, exc)
+        try:
+            governor.tool_span(tool_name, **kwargs)
+        except GatewayError:
+            pass
+
+
+def _outage_guard(
+    config: GatewayConfig, state_provider: Callable[[], GovernanceState]
+) -> OutageGuard:
+    """The circuit breaker and fail-open policy for one governor's tool checks.
+    `state_provider` gives it the polled heartbeat state (freshness, suspended)."""
+    return OutageGuard(
+        failure_mode=config.tool_check_failure_mode,
+        max_stale_seconds=config.fail_open_max_stale_seconds,
+        breaker_threshold=config.tool_check_breaker_threshold,
+        breaker_cooldown=config.tool_check_breaker_cooldown,
+        state_provider=state_provider,
+    )
+
+
+def _tool_span_kwargs(config: GatewayConfig, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Drops `result` unless `capture_tool_results` is on: one gate for every
+    adapter and guard(), so no call site can forget it. Redaction and the
+    500-character cut happen later, in telemetry.tool_span()."""
+    if not config.capture_tool_results:
+        kwargs.pop("result", None)
+    return kwargs
 
 
 def _identity_from_response(
@@ -78,6 +151,71 @@ def _identity_from_response(
         base_url=base_url,
         public_key_fingerprint=data.get("publicKeyFingerprint"),
         created_at=data.get("createdAt") or fallback_created_at,
+    )
+
+
+def _register_body(
+    config: GatewayConfig,
+    display_name: str | None,
+    framework: str | None,
+    allowed_tool_categories: list[str] | None,
+    allowed_llm_models: list[str] | None,
+    registration_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "displayName": display_name or config.agent_name,
+        "externalFramework": framework or config.framework,
+    }
+    if allowed_tool_categories is not None:
+        body["allowedToolCategories"] = allowed_tool_categories
+    if allowed_llm_models is not None:
+        body["allowedLlmModels"] = allowed_llm_models
+    if registration_metadata is not None:
+        body["registrationMetadata"] = registration_metadata
+    return body
+
+
+def _require_api_key(config: GatewayConfig) -> None:
+    if not config.api_key:
+        raise GatewayError(
+            "no org API key configured: set MATIMO_API_KEY or pass api_key=... "
+            "(every Gateway call, including the session handshake, needs it)"
+        )
+
+
+def _refuse_to_overwrite(config: GatewayConfig, name: str) -> None:
+    """Runs BEFORE the network call. POST /v1/identities is not idempotent and
+    the private key is returned exactly once, so registering over an existing
+    credentials file would orphan the previous identity with its key gone."""
+    meta_path, key_path = credentials_paths(name, config.credentials_dir)
+    if meta_path.exists() or key_path.exists():
+        raise GatewayError(
+            f"credentials for {name!r} already exist at {meta_path}. Registering again "
+            "would create a second identity and destroy the private key of the first. "
+            "Pass overwrite=True (CLI: --force) to replace them, or choose another name.",
+            code="credentials_exist",
+        )
+
+
+def _save_or_explain(identity: IdentityCredentials, credentials_dir: Any) -> None:
+    try:
+        save_credentials(identity, credentials_dir)
+    except OSError as exc:
+        raise GatewayError(
+            f"identity {identity.identity_id} exists on the server but its credentials "
+            f"could not be written ({exc}). The private key was returned once and is "
+            "still in memory as `governor.identity.private_key_pem` -- persist it now.",
+            code="credentials_not_saved",
+        ) from exc
+
+
+def _run_end_span(run_id: str, name: str, status: str, started: float) -> dict[str, Any]:
+    return run_span(
+        run_id,
+        name=name,
+        status=status,
+        session_id=run_id,
+        duration_ms=int((time.monotonic() - started) * 1000),
     )
 
 
@@ -107,7 +245,9 @@ class Governor:
         self._session: SessionManager | None = None
         self._tools: ToolGovernor | None = None
         self._telemetry: TelemetryExporter | None = None
+        self._control_stream: ControlStreamConsumer | None = None
         self._started = False
+        self._on_suspend_callback: Callable[[GovernanceState], None] | None = None
         # True once this process wrote (or found) a credentials file for the
         # bound identity; rotate_key() only overwrites the file in that case,
         # so a persist=False identity never leaks into ~/.matimo/agents.
@@ -135,7 +275,22 @@ class Governor:
     # -- identity / registration ------------------------------------------
 
     def _bind_identity(self, identity: IdentityCredentials) -> None:
-        self._identity = identity
+        if self._signer is not None and self._session is not None and self._tools is not None:
+            # Rebinding (register() again, rotate_key()): update the existing
+            # signer/session/tool objects in place. httpx clients, framework
+            # adapters, the telemetry exporter and guard()-wrapped callables all
+            # captured references to them; replacing them would leave those
+            # signing with the old, revoked key.
+            self._signer.rekey(identity)
+            self._session.rebind(identity)
+            self._tools.rebind(
+                identity_token=identity.identity_token,
+                identity_id=identity.identity_id,
+                tenant_id=identity.tenant_id,
+                external_framework=identity.external_framework,
+            )
+            self._identity = identity
+            return
         self._signer = JWSSigner.from_credentials(identity)
         self._http.signer = self._signer
         self._session = SessionManager(self._http, self._signer, identity)
@@ -145,7 +300,9 @@ class Governor:
             identity_id=identity.identity_id,
             tenant_id=identity.tenant_id,
             external_framework=identity.external_framework,
+            outage=_outage_guard(self.config, lambda: self.state),
         )
+        self._identity = identity
 
     @property
     def identity(self) -> IdentityCredentials | None:
@@ -160,28 +317,61 @@ class Governor:
         allowed_llm_models: list[str] | None = None,
         registration_metadata: dict[str, Any] | None = None,
         persist: bool = True,
+        overwrite: bool = False,
     ) -> IdentityCredentials:
         """POST /v1/identities. Not idempotent server-side -- calling this
         twice creates two identities. Persists the one-time privateKeyPem
-        locally unless persist=False."""
-        body: dict[str, Any] = {
-            "displayName": display_name or self.config.agent_name,
-            "externalFramework": framework or self.config.framework,
-        }
-        if allowed_tool_categories is not None:
-            body["allowedToolCategories"] = allowed_tool_categories
-        if allowed_llm_models is not None:
-            body["allowedLlmModels"] = allowed_llm_models
-        if registration_metadata is not None:
-            body["registrationMetadata"] = registration_metadata
-
+        locally unless persist=False, and refuses (before any network call)
+        to overwrite an existing credentials file unless overwrite=True."""
+        _require_api_key(self.config)
+        name = display_name or self.config.agent_name
+        if persist and not overwrite:
+            _refuse_to_overwrite(self.config, name)
+        body = _register_body(
+            self.config,
+            display_name,
+            framework,
+            allowed_tool_categories,
+            allowed_llm_models,
+            registration_metadata,
+        )
         resp = self._http.request("POST", REGISTER_PATH, json_body=body, sign=False)
         identity = _identity_from_response(resp.data, base_url=self.config.base_url)
-        if persist:
-            save_credentials(identity, self.config.credentials_dir)
-            self._persisted = True
+        # Bind before persisting: the key exists exactly once, so it must be held
+        # in memory even if the disk write below fails.
         self._bind_identity(identity)
+        if persist:
+            _save_or_explain(identity, self.config.credentials_dir)
+            self._persisted = True
         return identity
+
+    def check_health(self) -> dict[str, Any]:
+        """GET /v1/health -- QUALITY-REVIEW item 11 (2026-09-22). A cheap,
+        side-effect-free status probe: confirms the org API key is valid and
+        the tenant's Matimo Enterprise license is active, without registering
+        an identity or opening a session. Unlike every other Governor method,
+        this needs no identity at all -- only config.api_key -- so it can run
+        before register() and does not require Governor.from_env() to have
+        found local credentials.
+
+        Before this endpoint existed, the only way to answer "is the license
+        active" was a real POST /v1/identities call (see this SDK's own
+        scripts/live_check.py, which used to register a throwaway identity
+        purely to answer that question -- registered identities are never
+        deleted server-side, see docs/SERVER-CONTRACT.md section 10, so that
+        left an inert row behind on every run).
+
+        Raises GatewayError (status_code=403, code='license_required') when
+        the license is missing, expired or disabled -- that 403 IS the
+        "license inactive" signal; a 200 response's `license.active` is
+        always True (the server already rejected an inactive one before
+        returning). See docs/SERVER-CONTRACT.md section 0 for the response
+        shape: `{status, license: {active, mode, emergencyStopActive},
+        serverTime}`.
+        """
+        _require_api_key(self.config)
+        resp = self._http.request("GET", HEALTH_PATH, sign=False)
+        return dict(resp.data)
 
     def rotate_key(self) -> IdentityCredentials:
         """POST /v1/identities/:agentId/rotate-key. The new private key is
@@ -197,8 +387,9 @@ class Governor:
         identity = _identity_from_response(
             resp.data, base_url=self.config.base_url, fallback_created_at=self._identity.created_at
         )
-        self._persist_rotated(identity)
+        # Bind first: the new key is returned exactly once (see register()).
         self._bind_identity(identity)
+        self._persist_rotated(identity)
         return identity
 
     def _persist_rotated(self, identity: IdentityCredentials) -> None:
@@ -208,7 +399,7 @@ class Governor:
         copy, exactly as with register(persist=False)."""
         meta_path, _ = credentials_paths(identity.display_name, self.config.credentials_dir)
         if self._persisted or meta_path.exists():
-            save_credentials(identity, self.config.credentials_dir)
+            _save_or_explain(identity, self.config.credentials_dir)
             self._persisted = True
 
     # -- lifecycle ---------------------------------------------------------
@@ -217,10 +408,11 @@ class Governor:
         if self._identity is None:
             raise GatewayError(
                 "Governor has no identity: call governor.register(...) once, "
-                "or run `matimo register` and then Governor.from_env()."
+                "or run `matimo-agdk register` and then Governor.from_env()."
             )
         if self._started:
             return self
+        _require_api_key(self.config)
         heartbeat_interval = self.config.resolved_heartbeat_interval()
         self._telemetry = TelemetryExporter(
             self._http,
@@ -231,7 +423,21 @@ class Governor:
             heartbeat_interval=heartbeat_interval,
             fail_open=self.config.fail_open_telemetry,
             heartbeat_resolver=self.config.resolved_heartbeat_interval,
+            on_suspend=self._on_suspend_callback,
         )
+        # The push channel starts BEFORE the exporter thread on purpose:
+        # Thread.start() yields the GIL, and starting it after would let the
+        # exporter's first heartbeat run to completion before start() returns,
+        # i.e. before a caller's `governor.on_suspend(cb)` on the next line.
+        if self.config.control_stream_enabled and self._session is not None:
+            self._control_stream = ControlStreamConsumer(
+                self._http,
+                self._session,
+                self._telemetry,
+                lambda: self._identity.identity_id if self._identity is not None else None,
+                read_timeout=self.config.control_stream_read_timeout,
+            )
+            self._control_stream.start()
         self._telemetry.start()
         self._started = True
         return self
@@ -240,6 +446,9 @@ class Governor:
         """Flushes telemetry and stops the exporter. The HTTP client stays
         open so start() can be called again; call close() (or use the
         governor as a context manager) to release it."""
+        if self._control_stream is not None:
+            self._control_stream.stop()
+            self._control_stream = None
         if self._telemetry is not None:
             self._telemetry.stop()
         self._started = False
@@ -266,6 +475,15 @@ class Governor:
     def is_suspended(self) -> bool:
         return self.state.is_suspended
 
+    @property
+    def control_stream_status(self) -> str:
+        """'disabled' (turned off or not started), or the push channel's state:
+        'connecting', 'connected', 'backoff' or 'unsupported' (the server has no
+        stream; polling only). Informational: polling works in every state."""
+        if self._control_stream is None:
+            return "disabled"
+        return self._control_stream.status
+
     def raise_if_suspended(self) -> None:
         if self._telemetry is not None:
             self._telemetry.raise_if_suspended()
@@ -273,7 +491,15 @@ class Governor:
     def on_suspend(self, callback: Callable[[GovernanceState], None]) -> None:
         if self._telemetry is None:
             raise GatewayError("call governor.start() before registering an on_suspend callback")
-        self._telemetry._on_suspend = callback  # noqa: SLF001 -- single intended internal caller
+        self._on_suspend_callback = callback  # survives stop() then start()
+        self._telemetry.set_on_suspend(callback)
+
+    def flush(self) -> None:
+        """Sends everything queued right now, plus one heartbeat poll (which
+        refreshes `governor.state`). Raises GatewayError if the send fails."""
+        if self._telemetry is None:
+            raise GatewayError("call governor.start() before flush()")
+        self._telemetry.flush_now()
 
     # -- runs and spans ----------------------------------------------------
 
@@ -285,35 +511,51 @@ class Governor:
         self._emit(
             run_span(run_id, name=name, status="running", session_id=run_id, started_at=_now_iso())
         )
+        status = "completed"
         try:
             yield run_id
-        except Exception:
-            self._emit(
-                run_span(
-                    run_id,
-                    name=name,
-                    status="failed",
-                    session_id=run_id,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                )
-            )
+        except BaseException as exc:
+            # Gateway only ends a run on an explicit terminal span. A task
+            # cancellation or KeyboardInterrupt is not an `Exception`, so the
+            # old `except Exception` left such runs `running` until the sweep.
+            status = "failed" if isinstance(exc, Exception) else "cancelled"
             raise
-        else:
-            self._emit(
-                run_span(
-                    run_id,
-                    name=name,
-                    status="completed",
-                    session_id=run_id,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                )
-            )
         finally:
+            self._emit(_run_end_span(run_id, name, status, started))
             _current_run.reset(token)
 
     def _emit(self, event: dict[str, Any]) -> None:
         if self._telemetry is not None:
             self._telemetry.submit(event)
+
+    def run_span(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        name: str = "agent-run",
+        started_at: str | None = None,
+        duration_ms: int | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Emits a `kind:"run"` span for a run the framework owns (ADK's
+        invocation id), for adapters that cannot wrap the run in
+        `governor.run()`. `status="running"` opens it; a terminal status
+        (`completed`/`failed`/`cancelled`) is the only thing that ends it
+        server-side -- see docs/SERVER-CONTRACT.md section 7.3."""
+        if started_at is None and status == "running":
+            started_at = _now_iso()
+        self._emit(
+            run_span(
+                run_id,
+                name=name,
+                status=status,
+                session_id=run_id,
+                started_at=started_at,
+                duration_ms=duration_ms,
+                attributes=attributes,
+            )
+        )
 
     def llm_span(self, **kwargs: Any) -> None:
         run_id = kwargs.pop("run_id", None) or _current_run.get()
@@ -331,7 +573,7 @@ class Governor:
                 "tool_span() needs an active governor.run() block or an explicit run_id"
             )
         kwargs.setdefault("session_id", run_id)
-        self._emit(tool_span(run_id, tool_name, **kwargs))
+        self._emit(tool_span(run_id, tool_name, **_tool_span_kwargs(self.config, kwargs)))
 
     # -- tool governance ----------------------------------------------------
 
@@ -346,6 +588,15 @@ class Governor:
         if self._tools is None:
             raise GatewayError("Governor has no bound identity")
         return self._tools.await_decision(resume_token, **kwargs)
+
+    def check_and_wait(
+        self, tool_name: str, args: dict[str, Any] | None = None, **kwargs: Any
+    ) -> ToolDecision:
+        """check_tool(), then poll a PENDING to its final ALLOW/DENY. Never
+        returns PENDING -- see ToolGovernor.check_and_wait()."""
+        if self._tools is None:
+            raise GatewayError("Governor has no bound identity")
+        return self._tools.check_and_wait(tool_name, args, **kwargs)
 
     def set_tool_category(self, tool_name: str, category: str) -> None:
         if self._tools is None:
@@ -371,6 +622,11 @@ class Governor:
         Raises ToolDenied if the check (or the resolved PENDING decision)
         is DENY. The wrapped callable's own exceptions propagate unchanged
         after being recorded as a failed tool span.
+
+        With `fail_open_telemetry=False`, a stored telemetry flush error is
+        raised *before* the check and the tool run, so the call fails closed
+        with no side effect. Once the tool has run, a telemetry error is only
+        logged: it never replaces the tool's result or its exception.
         """
 
         def decorator(inner: Callable[..., R]) -> Callable[..., R]:
@@ -388,31 +644,38 @@ class Governor:
                     with self.run(f"tool:{tool_name}"):
                         return wrapper(*args, **kwargs)
                 call_args = _positional_to_kwargs(args, kwargs)
-                decision = tools.check(tool_name, call_args, category_hint=category)
-                if decision.pending and decision.resume_token:
-                    decision = tools.await_decision(decision.resume_token)
+                _raise_pending_telemetry_error(self)
+                decision = tools.check_and_wait(tool_name, call_args, category_hint=category)
                 if decision.denied:
-                    self.tool_span(tool_name, status="denied", duration_ms=0, arguments=call_args)
+                    _record_tool_span(
+                        self, tool_name, status="denied", duration_ms=0, arguments=call_args
+                    )
                     raise ToolDenied(decision.reason)
 
                 started = time.monotonic()
                 started_iso = _now_iso()
                 status = "completed"
                 error: str | None = None
+                span_result: Any = None
                 try:
                     result = inner(*args, **kwargs)
+                    span_result = result
                 except Exception as exc:
                     status = "error"
                     error = str(exc)
+                    span_result = error
                     raise
                 finally:
                     duration_ms = int((time.monotonic() - started) * 1000)
-                    self.tool_span(
+                    _record_tool_span(
+                        self,
                         tool_name,
                         status=status,
                         started_at=started_iso,
                         duration_ms=duration_ms,
                         arguments=call_args,
+                        result=span_result,
+                        attributes=degraded_attributes(decision),
                     )
                     if decision.resume_token:
                         tools.report_result(
@@ -438,11 +701,12 @@ class Governor:
         outgoing request, computed over the exact bytes httpx is about to
         send.
 
-        Point any OpenAI/Anthropic SDK's `http_client=` at this. A plain
+        Point an OpenAI SDK's `http_client=` at this. A plain
         `default_headers=` cannot carry a per-request signature (the
         signature must cover each request's own body bytes) -- this
         client, via its request event hook, is the mechanism that makes
-        that possible.
+        that possible. For the Anthropic SDK use `anthropic_http_client()`:
+        anthropic >= 1.6 is built on `httpx2` and rejects an `httpx.Client`.
 
         Also transparently re-handshakes exactly once on a live 401
         session_expired (e.g. another process called DELETE /v1/sessions,
@@ -450,13 +714,67 @@ class Governor:
         process's back) -- found missing entirely during live verification
         against a real Gateway; see SessionRetryTransport's docstring.
         """
+        session, signer = self._bound()
+        transport = SessionRetryTransport(
+            httpx.HTTPTransport(),
+            session,
+            signer,
+            signing_enabled=self.config.signing_enabled,
+        )
+        return httpx.Client(
+            base_url=self.config.base_url,
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            event_hooks={"request": [self._request_hook()]},
+            transport=transport,
+            timeout=self.config.http_timeout(),
+        )
+
+    def httpx2_client(self) -> Any:
+        """`httpx_client()` for SDKs built on `httpx2` (anthropic >= 1.6): the
+        same live session token, per-request signature and transparent
+        re-handshake, as an `httpx2.Client`. Needs the `httpx2` package."""
+        try:
+            from ._retry_transport_httpx2 import Httpx2SessionRetryTransport, httpx2
+        except ImportError as exc:
+            raise _bind_hint(exc) from exc
+        session, signer = self._bound()
+        transport = Httpx2SessionRetryTransport(
+            httpx2.HTTPTransport(),
+            session,
+            signer,
+            signing_enabled=self.config.signing_enabled,
+        )
+        return httpx2.Client(
+            base_url=self.config.base_url,
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            event_hooks={"request": [self._request_hook()]},
+            transport=transport,
+            timeout=self.config.http_timeout(httpx2),
+        )
+
+    def anthropic_http_client(self) -> Any:
+        """The right `http_client=` for `anthropic.Anthropic(...)`, whichever
+        HTTP library the installed anthropic release uses::
+
+            client = anthropic.Anthropic(
+                **governor.anthropic_client_kwargs(),
+                http_client=governor.anthropic_http_client(),
+            )
+        """
+        return self.httpx2_client() if sdk_requires_httpx2("anthropic") else self.httpx_client()
+
+    def _bound(self) -> tuple[SessionManager, JWSSigner]:
         if self._session is None or self._identity is None or self._signer is None:
             raise GatewayError("Governor has no bound identity")
-        session = self._session
-        signer = self._signer
+        return self._session, self._signer
+
+    def _request_hook(self) -> Callable[[Any], None]:
+        """The per-request hook shared by every client this governor builds
+        (library-agnostic: it only touches `request.headers`/`.content`)."""
+        session, signer = self._bound()
         config = self.config
 
-        def _hook(request: httpx.Request) -> None:
+        def _hook(request: Any) -> None:
             request.headers[SESSION_TOKEN_HEADER] = session.get_token()
             run_id = _current_run.get()
             if run_id:
@@ -465,20 +783,7 @@ class Governor:
                 jws = signer.sign_request(body_bytes=request.content or b"")
                 request.headers["Matimo-Agent-Signature"] = jws
 
-        transport = SessionRetryTransport(
-            httpx.HTTPTransport(),
-            session,
-            signer,
-            signing_enabled=config.signing_enabled,
-        )
-
-        return httpx.Client(
-            base_url=self.config.base_url,
-            headers={"Authorization": f"Bearer {self.config.api_key}"},
-            event_hooks={"request": [_hook]},
-            transport=transport,
-            timeout=self.config.http_timeout(),
-        )
+        return _hook
 
     def openai_client_kwargs(self) -> dict[str, Any]:
         """kwargs for `openai.OpenAI(**governor.openai_client_kwargs())`.
@@ -497,7 +802,8 @@ class Governor:
 
     def anthropic_client_kwargs(self) -> dict[str, Any]:
         """kwargs for `anthropic.Anthropic(**governor.anthropic_client_kwargs())`.
-        Same signing caveat as openai_client_kwargs().
+        Same signing caveat as openai_client_kwargs(): also pass
+        `http_client=governor.anthropic_http_client()` for a live, signed client.
 
         Uses `auth_token`, not `api_key`: the Anthropic SDK sends `api_key`
         as `x-api-key`, which Gateway does not read; `auth_token` is sent
@@ -554,7 +860,9 @@ class AsyncGovernor:
         self._session: AsyncSessionManager | None = None
         self._tools: AsyncToolGovernor | None = None
         self._telemetry: AsyncTelemetryExporter | None = None
+        self._control_stream: AsyncControlStreamConsumer | None = None
         self._started = False
+        self._on_suspend_callback: Callable[[GovernanceState], None] | None = None
         # True once this process wrote (or found) a credentials file for the
         # bound identity; rotate_key() only overwrites the file in that case,
         # so a persist=False identity never leaks into ~/.matimo/agents.
@@ -578,7 +886,18 @@ class AsyncGovernor:
         return cls(GatewayConfig.load(**overrides))
 
     def _bind_identity(self, identity: IdentityCredentials) -> None:
-        self._identity = identity
+        if self._signer is not None and self._session is not None and self._tools is not None:
+            # See Governor._bind_identity: rebind in place so captured references stay valid.
+            self._signer.rekey(identity)
+            self._session.rebind(identity)
+            self._tools.rebind(
+                identity_token=identity.identity_token,
+                identity_id=identity.identity_id,
+                tenant_id=identity.tenant_id,
+                external_framework=identity.external_framework,
+            )
+            self._identity = identity
+            return
         self._signer = JWSSigner.from_credentials(identity)
         self._http.signer = self._signer
         self._session = AsyncSessionManager(self._http, self._signer, identity)
@@ -588,7 +907,9 @@ class AsyncGovernor:
             identity_id=identity.identity_id,
             tenant_id=identity.tenant_id,
             external_framework=identity.external_framework,
+            outage=_outage_guard(self.config, lambda: self.state),
         )
+        self._identity = identity
 
     @property
     def identity(self) -> IdentityCredentials | None:
@@ -603,25 +924,34 @@ class AsyncGovernor:
         allowed_llm_models: list[str] | None = None,
         registration_metadata: dict[str, Any] | None = None,
         persist: bool = True,
+        overwrite: bool = False,
     ) -> IdentityCredentials:
-        body: dict[str, Any] = {
-            "displayName": display_name or self.config.agent_name,
-            "externalFramework": framework or self.config.framework,
-        }
-        if allowed_tool_categories is not None:
-            body["allowedToolCategories"] = allowed_tool_categories
-        if allowed_llm_models is not None:
-            body["allowedLlmModels"] = allowed_llm_models
-        if registration_metadata is not None:
-            body["registrationMetadata"] = registration_metadata
-
+        """Async twin of Governor.register()."""
+        _require_api_key(self.config)
+        name = display_name or self.config.agent_name
+        if persist and not overwrite:
+            _refuse_to_overwrite(self.config, name)
+        body = _register_body(
+            self.config,
+            display_name,
+            framework,
+            allowed_tool_categories,
+            allowed_llm_models,
+            registration_metadata,
+        )
         resp = await self._http.request("POST", REGISTER_PATH, json_body=body, sign=False)
         identity = _identity_from_response(resp.data, base_url=self.config.base_url)
-        if persist:
-            save_credentials(identity, self.config.credentials_dir)
-            self._persisted = True
         self._bind_identity(identity)
+        if persist:
+            _save_or_explain(identity, self.config.credentials_dir)
+            self._persisted = True
         return identity
+
+    async def check_health(self) -> dict[str, Any]:
+        """Async twin of Governor.check_health()."""
+        _require_api_key(self.config)
+        resp = await self._http.request("GET", HEALTH_PATH, sign=False)
+        return dict(resp.data)
 
     async def rotate_key(self) -> IdentityCredentials:
         if self._identity is None:
@@ -632,8 +962,9 @@ class AsyncGovernor:
         identity = _identity_from_response(
             resp.data, base_url=self.config.base_url, fallback_created_at=self._identity.created_at
         )
-        self._persist_rotated(identity)
+        # Bind first: the new key is returned exactly once (see register()).
         self._bind_identity(identity)
+        self._persist_rotated(identity)
         return identity
 
     def _persist_rotated(self, identity: IdentityCredentials) -> None:
@@ -643,17 +974,18 @@ class AsyncGovernor:
         copy, exactly as with register(persist=False)."""
         meta_path, _ = credentials_paths(identity.display_name, self.config.credentials_dir)
         if self._persisted or meta_path.exists():
-            save_credentials(identity, self.config.credentials_dir)
+            _save_or_explain(identity, self.config.credentials_dir)
             self._persisted = True
 
     async def start(self) -> AsyncGovernor:
         if self._identity is None:
             raise GatewayError(
                 "Governor has no identity: call governor.register(...) once, "
-                "or run `matimo register` and then AsyncGovernor.from_env()."
+                "or run `matimo-agdk register` and then AsyncGovernor.from_env()."
             )
         if self._started:
             return self
+        _require_api_key(self.config)
         heartbeat_interval = self.config.resolved_heartbeat_interval()
         self._telemetry = AsyncTelemetryExporter(
             self._http,
@@ -664,12 +996,25 @@ class AsyncGovernor:
             heartbeat_interval=heartbeat_interval,
             fail_open=self.config.fail_open_telemetry,
             heartbeat_resolver=self.config.resolved_heartbeat_interval,
+            on_suspend=self._on_suspend_callback,
         )
         await self._telemetry.start()
+        if self.config.control_stream_enabled and self._session is not None:
+            self._control_stream = AsyncControlStreamConsumer(
+                self._http,
+                self._session,
+                self._telemetry,
+                lambda: self._identity.identity_id if self._identity is not None else None,
+                read_timeout=self.config.control_stream_read_timeout,
+            )
+            await self._control_stream.start()
         self._started = True
         return self
 
     async def stop(self) -> None:
+        if self._control_stream is not None:
+            await self._control_stream.stop()
+            self._control_stream = None
         if self._telemetry is not None:
             await self._telemetry.stop()
         self._started = False
@@ -694,6 +1039,13 @@ class AsyncGovernor:
     def is_suspended(self) -> bool:
         return self.state.is_suspended
 
+    @property
+    def control_stream_status(self) -> str:
+        """Async twin of Governor.control_stream_status."""
+        if self._control_stream is None:
+            return "disabled"
+        return self._control_stream.status
+
     def raise_if_suspended(self) -> None:
         if self._telemetry is not None:
             self._telemetry.raise_if_suspended()
@@ -703,7 +1055,14 @@ class AsyncGovernor:
             raise GatewayError(
                 "call await governor.start() before registering an on_suspend callback"
             )
-        self._telemetry._on_suspend = callback  # noqa: SLF001
+        self._on_suspend_callback = callback  # survives stop() then start()
+        self._telemetry.set_on_suspend(callback)
+
+    async def flush(self) -> None:
+        """Async twin of Governor.flush()."""
+        if self._telemetry is None:
+            raise GatewayError("call await governor.start() before flush()")
+        await self._telemetry.flush_now()
 
     @asynccontextmanager
     async def run(self, name: str = "agent-run") -> AsyncIterator[str]:
@@ -713,35 +1072,51 @@ class AsyncGovernor:
         self._emit(
             run_span(run_id, name=name, status="running", session_id=run_id, started_at=_now_iso())
         )
+        status = "completed"
         try:
             yield run_id
-        except Exception:
-            self._emit(
-                run_span(
-                    run_id,
-                    name=name,
-                    status="failed",
-                    session_id=run_id,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                )
-            )
+        except BaseException as exc:
+            # Gateway only ends a run on an explicit terminal span. A task
+            # cancellation or KeyboardInterrupt is not an `Exception`, so the
+            # old `except Exception` left such runs `running` until the sweep.
+            status = "failed" if isinstance(exc, Exception) else "cancelled"
             raise
-        else:
-            self._emit(
-                run_span(
-                    run_id,
-                    name=name,
-                    status="completed",
-                    session_id=run_id,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                )
-            )
         finally:
+            self._emit(_run_end_span(run_id, name, status, started))
             _current_run.reset(token)
 
     def _emit(self, event: dict[str, Any]) -> None:
         if self._telemetry is not None:
             self._telemetry.submit(event)
+
+    def run_span(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        name: str = "agent-run",
+        started_at: str | None = None,
+        duration_ms: int | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Emits a `kind:"run"` span for a run the framework owns (ADK's
+        invocation id), for adapters that cannot wrap the run in
+        `governor.run()`. `status="running"` opens it; a terminal status
+        (`completed`/`failed`/`cancelled`) is the only thing that ends it
+        server-side -- see docs/SERVER-CONTRACT.md section 7.3."""
+        if started_at is None and status == "running":
+            started_at = _now_iso()
+        self._emit(
+            run_span(
+                run_id,
+                name=name,
+                status=status,
+                session_id=run_id,
+                started_at=started_at,
+                duration_ms=duration_ms,
+                attributes=attributes,
+            )
+        )
 
     def llm_span(self, **kwargs: Any) -> None:
         run_id = kwargs.pop("run_id", None) or _current_run.get()
@@ -759,7 +1134,7 @@ class AsyncGovernor:
                 "tool_span() needs an active governor.run() block or an explicit run_id"
             )
         kwargs.setdefault("session_id", run_id)
-        self._emit(tool_span(run_id, tool_name, **kwargs))
+        self._emit(tool_span(run_id, tool_name, **_tool_span_kwargs(self.config, kwargs)))
 
     async def check_tool(
         self, tool_name: str, args: dict[str, Any] | None = None, **kwargs: Any
@@ -772,6 +1147,14 @@ class AsyncGovernor:
         if self._tools is None:
             raise GatewayError("Governor has no bound identity")
         return await self._tools.await_decision(resume_token, **kwargs)
+
+    async def check_and_wait(
+        self, tool_name: str, args: dict[str, Any] | None = None, **kwargs: Any
+    ) -> ToolDecision:
+        """Async twin of Governor.check_and_wait()."""
+        if self._tools is None:
+            raise GatewayError("Governor has no bound identity")
+        return await self._tools.check_and_wait(tool_name, args, **kwargs)
 
     async def set_tool_category(self, tool_name: str, category: str) -> None:
         if self._tools is None:
@@ -799,31 +1182,38 @@ class AsyncGovernor:
                     async with self.run(f"tool:{tool_name}"):
                         return await wrapper(*args, **kwargs)
                 call_args = _positional_to_kwargs(args, kwargs)
-                decision = await tools.check(tool_name, call_args, category_hint=category)
-                if decision.pending and decision.resume_token:
-                    decision = await tools.await_decision(decision.resume_token)
+                _raise_pending_telemetry_error(self)
+                decision = await tools.check_and_wait(tool_name, call_args, category_hint=category)
                 if decision.denied:
-                    self.tool_span(tool_name, status="denied", duration_ms=0, arguments=call_args)
+                    _record_tool_span(
+                        self, tool_name, status="denied", duration_ms=0, arguments=call_args
+                    )
                     raise ToolDenied(decision.reason)
 
                 started = time.monotonic()
                 started_iso = _now_iso()
                 status = "completed"
                 error: str | None = None
+                span_result: Any = None
                 try:
                     result = await inner(*args, **kwargs)
+                    span_result = result
                 except Exception as exc:
                     status = "error"
                     error = str(exc)
+                    span_result = error
                     raise
                 finally:
                     duration_ms = int((time.monotonic() - started) * 1000)
-                    self.tool_span(
+                    _record_tool_span(
+                        self,
                         tool_name,
                         status=status,
                         started_at=started_iso,
                         duration_ms=duration_ms,
                         arguments=call_args,
+                        result=span_result,
+                        attributes=degraded_attributes(decision),
                     )
                     if decision.resume_token:
                         await tools.report_result(
@@ -843,13 +1233,62 @@ class AsyncGovernor:
     def httpx_async_client(self) -> httpx.AsyncClient:
         """Async twin of Governor.httpx_client(), including the same
         transparent re-handshake-on-401-session_expired behavior."""
+        session, signer = self._bound()
+        transport = AsyncSessionRetryTransport(
+            httpx.AsyncHTTPTransport(),
+            session,
+            signer,
+            signing_enabled=self.config.signing_enabled,
+        )
+        return httpx.AsyncClient(
+            base_url=self.config.base_url,
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            event_hooks={"request": [self._request_hook()]},
+            transport=transport,
+            timeout=self.config.http_timeout(),
+        )
+
+    def httpx2_async_client(self) -> Any:
+        """Async twin of Governor.httpx2_client(): an `httpx2.AsyncClient` for
+        SDKs built on `httpx2` (anthropic >= 1.6). Needs the `httpx2` package."""
+        try:
+            from ._retry_transport_httpx2 import Httpx2AsyncSessionRetryTransport, httpx2
+        except ImportError as exc:
+            raise _bind_hint(exc) from exc
+        session, signer = self._bound()
+        transport = Httpx2AsyncSessionRetryTransport(
+            httpx2.AsyncHTTPTransport(),
+            session,
+            signer,
+            signing_enabled=self.config.signing_enabled,
+        )
+        return httpx2.AsyncClient(
+            base_url=self.config.base_url,
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            event_hooks={"request": [self._request_hook()]},
+            transport=transport,
+            timeout=self.config.http_timeout(httpx2),
+        )
+
+    def anthropic_http_client(self) -> Any:
+        """The right `http_client=` for `anthropic.AsyncAnthropic(...)`,
+        whichever HTTP library the installed anthropic release uses."""
+        return (
+            self.httpx2_async_client()
+            if sdk_requires_httpx2("anthropic")
+            else self.httpx_async_client()
+        )
+
+    def _bound(self) -> tuple[AsyncSessionManager, JWSSigner]:
         if self._session is None or self._identity is None or self._signer is None:
             raise GatewayError("Governor has no bound identity")
-        session = self._session
-        signer = self._signer
+        return self._session, self._signer
+
+    def _request_hook(self) -> Callable[[Any], Awaitable[None]]:
+        session, signer = self._bound()
         config = self.config
 
-        async def _hook(request: httpx.Request) -> None:
+        async def _hook(request: Any) -> None:
             request.headers[SESSION_TOKEN_HEADER] = await session.get_token()
             run_id = _current_run.get()
             if run_id:
@@ -858,20 +1297,7 @@ class AsyncGovernor:
                 jws = signer.sign_request(body_bytes=request.content or b"")
                 request.headers["Matimo-Agent-Signature"] = jws
 
-        transport = AsyncSessionRetryTransport(
-            httpx.AsyncHTTPTransport(),
-            session,
-            signer,
-            signing_enabled=config.signing_enabled,
-        )
-
-        return httpx.AsyncClient(
-            base_url=self.config.base_url,
-            headers={"Authorization": f"Bearer {self.config.api_key}"},
-            event_hooks={"request": [_hook]},
-            transport=transport,
-            timeout=self.config.http_timeout(),
-        )
+        return _hook
 
     async def openai_client_kwargs(self) -> dict[str, Any]:
         return {

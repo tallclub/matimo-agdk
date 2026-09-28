@@ -5,11 +5,16 @@ envelope) and AGDK-SERVER-HEARTBEAT-REPORT.md (the heartbeat now riding
 every POST /v1/telemetry/batch response, including a pure {"events": []}
 poll, which never touches last_telemetry_at server-side).
 
-Rapid suspend is POLLED, not pushed (docs/SERVER-CONTRACT.md section 10:
-"No push-based kill switch"). Name and document this honestly: a suspend
-or emergency stop takes up to one heartbeat interval to be observed
-locally, even though the *next Gateway call* is denied immediately
-server-side regardless of this local state.
+Rapid suspend has two channels. The POLLED heartbeat above is the guarantee: a
+suspend or emergency stop is observed within one heartbeat interval, and the
+*next Gateway call* is denied immediately server-side regardless of this local
+state. On top of that, matimo_agdk.control_stream keeps a Server-Sent Events
+connection to GET /v1/control/stream and pushes suspend, revoke and emergency
+stop to `GovernanceState` within about a second. A push is only ever a HINT
+(see GovernanceState.tighten_from_hint): it can tighten local state at once but
+never relaxes it, and every push also triggers an immediate heartbeat poll that
+sets the authoritative state. Polling behaviour is unchanged when the stream is
+off, unsupported by the server, or down.
 """
 
 from __future__ import annotations
@@ -18,13 +23,14 @@ import asyncio
 import atexit
 import logging
 import queue
+import random
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from ._redact import redact
+from ._redact import redact, scrub_string
 from .exceptions import AgentSuspendedLocally, GatewayError
 from .transport import AsyncGatewayHTTP, GatewayHTTP
 
@@ -35,10 +41,38 @@ Kind = Literal["run", "llm", "tool", "log", "error"]
 
 _MAX_ATTRIBUTE_VALUE_LEN = 2000
 
+# The server validates a whole batch at once (telemetryBatchSchema): one event over
+# a limit makes it answer 400 for every event in the batch, and a 400 batch is dropped.
+# These are its limits (docs/SERVER-CONTRACT.md 7.1; contract-tested in tests/contract).
+_MAX_ID_LEN = 120
+_MAX_NAME_LEN = 255
+_MAX_STATUS_LEN = 20
+
+# 4xx statuses that mean "this request as sent will never be accepted".
+# 401/403 (session/auth/policy), 408 and 429 are excluded: those are about the
+# sender's state or a passing condition, so the same batch may succeed later.
+_TRANSIENT_4XX = frozenset({401, 403, 408, 425, 429})
+
+
+def _is_permanent_rejection(exc: GatewayError) -> bool:
+    """True when the server rejected the batch itself (400 validation error,
+    413 too large, 422, ...). Retrying that same batch forever would wedge the
+    exporter behind one poison event, so it is dropped instead."""
+    status = exc.status_code
+    return status is not None and 400 <= status < 500 and status not in _TRANSIENT_4XX
+
 
 # ---------------------------------------------------------------------------
 # GovernanceState
 # ---------------------------------------------------------------------------
+
+# Higher is more restrictive. Anything not listed (an unknown status, "active")
+# counts as 0, so a hint can only ever move the state upward.
+_LIFECYCLE_SEVERITY = {"active": 0, "unknown": 0, "suspended": 1, "revoked": 2}
+
+# A tenant-wide push (emergency stop) reaches every agent of the tenant at once;
+# this spreads the confirming heartbeat polls those pushes trigger.
+_TENANT_WIDE_REFRESH_JITTER_SECONDS = 1.0
 
 
 @dataclass
@@ -55,7 +89,21 @@ class GovernanceState:
     telemetry_mode: str = "advisory"
     telemetry_staleness_minutes: float = 30.0
     server_time: str | None = None
+    # Gateway's per-tenant configuration version, from the heartbeat's
+    # `configVersion`. It changes whenever a policy, guardrail (or its binding), a
+    # tool category, the tenant license or this identity's governance fields are
+    # written. Opaque: compare it for inequality with the value you saw last, do
+    # not do arithmetic on it. None until a heartbeat has carried one, and it keeps
+    # its last value when a heartbeat carries none (an older Gateway, or a
+    # server-side read that failed and sent `null`), so "no information" is never
+    # mistaken for a change. The SDK caches no decisions or policy itself, so it
+    # only surfaces this; use it to decide when to re-check anything you cached.
+    config_version: int | None = None
     last_polled_monotonic: float = field(default_factory=time.monotonic)
+    # Unlike last_polled_monotonic (which starts at "now"), this is None until a
+    # heartbeat has really arrived, so "never heard from Gateway" is distinguishable
+    # from "heard just now". The tool-check fail-open rule reads it.
+    last_heartbeat_monotonic: float | None = None
 
     def update_from_heartbeat(self, heartbeat: dict[str, Any]) -> None:
         self.lifecycle_status = heartbeat.get("lifecycleStatus", self.lifecycle_status)
@@ -65,11 +113,53 @@ class GovernanceState:
             "telemetryStalenessMinutes", self.telemetry_staleness_minutes
         )
         self.server_time = heartbeat.get("serverTime", self.server_time)
+        version = heartbeat.get("configVersion")
+        if isinstance(version, int) and not isinstance(version, bool):
+            self.config_version = version
         self.last_polled_monotonic = time.monotonic()
+        self.last_heartbeat_monotonic = self.last_polled_monotonic
 
     @property
     def is_suspended(self) -> bool:
         return self.emergency_stop or self.lifecycle_status in ("suspended", "revoked")
+
+    def tighten_from_hint(self, name: str, data: Any, identity_id: str | None) -> bool:
+        """Applies a control-stream event to local state, in the TIGHTENING
+        direction only, and returns True when something changed.
+
+        Why an event cannot grant more access than polling would: pub/sub is
+        at-most-once and may arrive late or out of order, so an event is never
+        trusted to *relax* anything. `suspended` and `revoked` (and emergency
+        stop on) take effect immediately, because acting on a wrong tighten is
+        cheap and self-correcting (the heartbeat the caller triggers next sets
+        the real state), while acting on a wrong relax would let a suspended
+        agent run. Restore, emergency stop off and an "active" snapshot change
+        nothing here; the caller re-reads the heartbeat for those. An event
+        about another identity is ignored, and so is any malformed one.
+        Never touches `config_version`, `server_time` or the heartbeat clocks:
+        those belong to the heartbeat alone.
+        """
+        if not isinstance(data, dict):
+            return False
+        identity_scoped = name in ("lifecycle", "ready")
+        if identity_scoped:
+            if identity_id is None or data.get("identityId") != identity_id:
+                return False
+        elif name != "emergency_stop":
+            return False
+        tightened = False
+        if identity_scoped:
+            status = data.get("lifecycleStatus")
+            if status in ("suspended", "revoked") and _LIFECYCLE_SEVERITY[status] > (
+                _LIFECYCLE_SEVERITY.get(self.lifecycle_status, 0)
+            ):
+                self.lifecycle_status = status
+                tightened = True
+        if name in ("emergency_stop", "ready"):
+            if data.get("emergencyStop") is True and not self.emergency_stop:
+                self.emergency_stop = True
+                tightened = True
+        return tightened
 
 
 # ---------------------------------------------------------------------------
@@ -99,21 +189,23 @@ def build_event(
     duration_ms: int | None = None,
     attributes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    event: dict[str, Any] = {"runId": run_id, "kind": kind}
+    event: dict[str, Any] = {"runId": str(run_id)[:_MAX_ID_LEN], "kind": kind}
     if session_id is not None:
-        event["sessionId"] = session_id
+        event["sessionId"] = str(session_id)[:_MAX_ID_LEN]
     if span_id is not None:
-        event["spanId"] = span_id
+        event["spanId"] = str(span_id)[:_MAX_ID_LEN]
     if parent_span_id is not None:
-        event["parentSpanId"] = parent_span_id
+        event["parentSpanId"] = str(parent_span_id)[:_MAX_ID_LEN]
     if name is not None:
-        event["name"] = name
+        event["name"] = str(name)[:_MAX_NAME_LEN]
     if status is not None:
-        event["status"] = status
+        event["status"] = str(status)[:_MAX_STATUS_LEN]
     if started_at is not None:
         event["startedAt"] = started_at
     if duration_ms is not None:
-        event["durationMs"] = duration_ms
+        # The server wants a non-negative integer; a float or a negative would 400
+        # the whole batch.
+        event["durationMs"] = max(0, int(duration_ms))
     if attributes:
         event["attributes"] = redact_attributes(attributes)
     return event
@@ -151,6 +243,8 @@ def llm_span(
     started_at: str | None = None,
     duration_ms: int | None = None,
     session_id: str | None = None,
+    span_id: str | None = None,
+    parent_span_id: str | None = None,
     model: str | None = None,
     provider: str | None = None,
     finish_reasons: list[str] | None = None,
@@ -180,8 +274,22 @@ def llm_span(
         started_at=started_at,
         duration_ms=duration_ms,
         session_id=session_id,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
         attributes=attrs,
     )
+
+
+MAX_TOOL_RESULT_LEN = 500
+
+
+def result_text(result: Any) -> str:
+    """A tool result as span text: key-redacted if it is a dict or list, scrubbed
+    for secret-shaped strings, then cut to MAX_TOOL_RESULT_LEN characters.
+    Redaction runs on the whole value before the cut, so a secret straddling the
+    limit is masked rather than half-sent."""
+    text = str(redact(result))
+    return scrub_string(text)[:MAX_TOOL_RESULT_LEN]
 
 
 def tool_span(
@@ -192,6 +300,8 @@ def tool_span(
     started_at: str | None = None,
     duration_ms: int | None = None,
     session_id: str | None = None,
+    span_id: str | None = None,
+    parent_span_id: str | None = None,
     call_id: str | None = None,
     arguments: Any | None = None,
     result: Any | None = None,
@@ -205,7 +315,7 @@ def tool_span(
     if arguments is not None:
         attrs.setdefault("gen_ai.tool.call.arguments", arguments)
     if result is not None:
-        attrs.setdefault("gen_ai.tool.call.result", str(result)[:500])
+        attrs.setdefault("gen_ai.tool.call.result", result_text(result))
     return build_event(
         run_id=run_id,
         kind="tool",
@@ -214,6 +324,8 @@ def tool_span(
         started_at=started_at,
         duration_ms=duration_ms,
         session_id=session_id,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
         attributes=attrs,
     )
 
@@ -263,6 +375,10 @@ class TelemetryExporter:
         self.last_error: GatewayError | None = None
         self._first_tick = True
         self._stop_event = threading.Event()
+        # Wakes the loop early, for a stop or a requested heartbeat refresh.
+        self._wake = threading.Event()
+        self._refresh_requested = threading.Event()
+        self._refresh_jitter = False
         self._thread: threading.Thread | None = None
         self._last_flush_monotonic = time.monotonic()
         self._suspend_notified = False
@@ -272,6 +388,7 @@ class TelemetryExporter:
         if self._thread is not None:
             return
         self._stop_event.clear()
+        self._wake.clear()
         self._thread = threading.Thread(target=self._run, name="matimo-agdk-telemetry", daemon=True)
         self._thread.start()
         atexit.register(self.stop)
@@ -279,11 +396,42 @@ class TelemetryExporter:
     def stop(self, *, timeout: float = 5.0) -> None:
         if self._thread is None:
             return
+        # Drop the atexit reference: it would otherwise pin this exporter (and
+        # its HTTP client) for the life of the process and fire again at exit.
+        atexit.unregister(self.stop)
         self._stop_event.set()
+        self._wake.set()
         self._thread.join(timeout=timeout)
         self._thread = None
-        self._flush(force=True)
+        self._flush_all()
         self._raise_pending()
+
+    def set_on_suspend(self, callback: Callable[[GovernanceState], None] | None) -> None:
+        self._on_suspend = callback
+        # A callback registered after the agent was already found suspended
+        # (start() then on_suspend() races the first heartbeat or a push) still
+        # fires once, instead of being silently skipped.
+        if callback is not None:
+            self._maybe_notify_suspend()
+
+    def apply_control_hint(self, name: str, data: Any, identity_id: str | None) -> bool:
+        """Tightens local state from a control-stream event (see
+        GovernanceState.tighten_from_hint) and fires `on_suspend` at once if
+        that made the agent suspended. Called from the stream's thread."""
+        with self._state_lock:
+            tightened = self.state.tighten_from_hint(name, data, identity_id)
+        if tightened:
+            self._maybe_notify_suspend()
+        return tightened
+
+    def request_refresh(self, *, jitter: bool = False) -> None:
+        """Asks the exporter thread to poll the heartbeat now instead of at its
+        next interval. Safe from any thread and never blocks. `jitter` delays
+        the poll by up to a second, for tenant-wide events every agent hears."""
+        if jitter:
+            self._refresh_jitter = True
+        self._refresh_requested.set()
+        self._wake.set()
 
     def _raise_pending(self) -> None:
         if self._fail_open or self.last_error is None:
@@ -307,18 +455,45 @@ class TelemetryExporter:
                 self.dropped_count += 1
 
     def flush_now(self) -> None:
-        """Synchronous, on-demand flush -- mainly for tests and for
+        """Synchronous, on-demand flush of everything queued (always at least
+        one request, so it doubles as a heartbeat) -- for tests, the CLI and
         `governor.stop()`'s final drain."""
-        self._flush(force=True)
+        self._flush_all()
         self._raise_pending()
+
+    def _flush_all(self) -> None:
+        """Sends batches until the queue is empty or a send fails. A single
+        `_flush` sends at most `batch_size` events, so a one-shot call would
+        silently strand the rest of a backlog at shutdown."""
+        ok = self._flush(force=True)
+        while ok and not self._queue.empty():
+            ok = self._flush(force=True)
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            # The first tick is a forced heartbeat so the server-reported
-            # staleness window sizes the interval before the first idle wait.
-            self._flush(force=self._first_tick)
+            backlog = False
+            # Cleared BEFORE the flush: a refresh requested while this iteration
+            # is in flight survives to the next one instead of being lost.
+            refresh = self._refresh_requested.is_set()
+            if refresh:
+                self._refresh_requested.clear()
+                if self._refresh_jitter:
+                    self._refresh_jitter = False
+                    self._stop_event.wait(random.uniform(0.0, _TENANT_WIDE_REFRESH_JITTER_SECONDS))
+                    if self._stop_event.is_set():
+                        break
+            try:
+                # The first tick is a forced heartbeat so the server-reported
+                # staleness window sizes the interval before the first idle wait.
+                ok = self._flush(force=self._first_tick or refresh)
+                backlog = ok and not self._queue.empty()
+            except Exception:  # noqa: BLE001 -- the exporter thread must never die
+                _log.exception("telemetry exporter iteration failed; will retry")
             self._first_tick = False
-            self._stop_event.wait(min(self._flush_interval, self._heartbeat_interval))
+            # A backlog is drained back to back; only an idle queue waits.
+            if not backlog:
+                self._wake.wait(min(self._flush_interval, self._heartbeat_interval))
+                self._wake.clear()
 
     def _drain(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -329,12 +504,14 @@ class TelemetryExporter:
                 break
         return events
 
-    def _flush(self, *, force: bool = False) -> None:
+    def _flush(self, *, force: bool = False) -> bool:
+        """Sends one batch. Returns False if the send failed (the batch is
+        re-queued, or dropped when the server rejected it outright)."""
         now = time.monotonic()
         events = self._drain()
         due_for_heartbeat = (now - self._last_flush_monotonic) >= self._heartbeat_interval
         if not events and not due_for_heartbeat and not force:
-            return
+            return True
         self._last_flush_monotonic = now
         try:
             # call_with_retry() re-handshakes exactly once if the session
@@ -361,12 +538,24 @@ class TelemetryExporter:
             # never blocked; without it the error is stored and raised on
             # the caller's next submit()/flush_now()/stop() instead of
             # killing this thread (which silently stopped heartbeats).
-            for event in events:
-                self._requeue(event)
+            permanent = _is_permanent_rejection(exc)
+            if permanent:
+                # Re-sending a batch the server refuses on its merits would wedge
+                # the exporter behind it forever; drop it and keep going.
+                self.dropped_count += len(events)
+                _log.warning("telemetry batch of %d rejected and dropped: %s", len(events), exc)
+            else:
+                for event in events:
+                    self._requeue(event)
             if not self._fail_open:
                 _log.warning("telemetry flush failed (fail_open=False): %s", exc)
                 self.last_error = exc
-            return
+            return permanent
+        except Exception:  # noqa: BLE001 -- e.g. a malformed response; never lose the batch
+            _log.exception("telemetry flush failed unexpectedly; batch re-queued")
+            for event in events:
+                self._requeue(event)
+            return False
         heartbeat = (resp.data or {}).get("heartbeat") if isinstance(resp.data, dict) else None
         if heartbeat:
             self.state.update_from_heartbeat(heartbeat)
@@ -375,6 +564,7 @@ class TelemetryExporter:
                     float(self.state.telemetry_staleness_minutes)
                 )
             self._maybe_notify_suspend()
+        return True
 
     def _requeue(self, event: dict[str, Any]) -> None:
         try:
@@ -384,12 +574,23 @@ class TelemetryExporter:
 
     def _maybe_notify_suspend(self) -> None:
         with self._state_lock:
-            if self.state.is_suspended and not self._suspend_notified:
-                self._suspend_notified = True
-                if self._on_suspend:
-                    self._on_suspend(self.state)
-            elif not self.state.is_suspended:
+            if not self.state.is_suspended:
                 self._suspend_notified = False
+                return
+            if self._suspend_notified:
+                return
+            callback = self._on_suspend
+            if callback is None:
+                # Nobody to tell yet: stay un-notified so a callback registered
+                # later (set_on_suspend) still fires for this suspension.
+                return
+            self._suspend_notified = True
+        # Outside the lock, and isolated: a user callback must not be able to
+        # deadlock or kill the exporter thread.
+        try:
+            callback(self.state)
+        except Exception:  # noqa: BLE001
+            _log.exception("on_suspend callback raised")
 
     def is_suspended(self) -> bool:
         return self.state.is_suspended
@@ -438,6 +639,10 @@ class AsyncTelemetryExporter:
         self._first_tick = True
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        # Wakes the loop early, for a stop or a requested heartbeat refresh.
+        self._wake: asyncio.Event | None = None
+        self._refresh_requested = False
+        self._refresh_jitter = False
         self._last_flush_monotonic = time.monotonic()
         self._suspend_notified = False
 
@@ -446,27 +651,56 @@ class AsyncTelemetryExporter:
             self._queue = asyncio.Queue(maxsize=self._queue_max)
         if self._stop_event is None:
             self._stop_event = asyncio.Event()
+        if self._wake is None:
+            self._wake = asyncio.Event()
 
     async def start(self) -> None:
         self._ensure_bound()
         if self._task is not None:
             return
         assert self._stop_event is not None
+        assert self._wake is not None
         self._stop_event.clear()
+        self._wake.clear()
         self._task = asyncio.ensure_future(self._run())
 
     async def stop(self, *, timeout: float = 5.0) -> None:
         if self._task is None:
             return
         assert self._stop_event is not None
+        assert self._wake is not None
         self._stop_event.set()
+        self._wake.set()
         try:
             await asyncio.wait_for(self._task, timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._task.cancel()
         self._task = None
-        await self._flush(force=True)
+        await self._flush_all()
         self._raise_pending()
+
+    def set_on_suspend(self, callback: Callable[[GovernanceState], None] | None) -> None:
+        self._on_suspend = callback
+        if callback is not None:
+            self._maybe_notify_suspend()
+
+    def apply_control_hint(self, name: str, data: Any, identity_id: str | None) -> bool:
+        """Async twin of TelemetryExporter.apply_control_hint(). Runs on the
+        event loop, so it needs no lock."""
+        tightened = self.state.tighten_from_hint(name, data, identity_id)
+        if tightened:
+            self._maybe_notify_suspend()
+        return tightened
+
+    def request_refresh(self, *, jitter: bool = False) -> None:
+        """Async twin of TelemetryExporter.request_refresh(). Call it from the
+        exporter's own event loop (the control-stream task does)."""
+        self._ensure_bound()
+        assert self._wake is not None
+        if jitter:
+            self._refresh_jitter = True
+        self._refresh_requested = True
+        self._wake.set()
 
     def _raise_pending(self) -> None:
         if self._fail_open or self.last_error is None:
@@ -492,21 +726,48 @@ class AsyncTelemetryExporter:
                 self.dropped_count += 1
 
     async def flush_now(self) -> None:
-        await self._flush(force=True)
+        await self._flush_all()
         self._raise_pending()
+
+    async def _flush_all(self) -> None:
+        """See TelemetryExporter._flush_all()."""
+        self._ensure_bound()
+        assert self._queue is not None
+        ok = await self._flush(force=True)
+        while ok and not self._queue.empty():
+            ok = await self._flush(force=True)
 
     async def _run(self) -> None:
         assert self._stop_event is not None
+        assert self._queue is not None
+        assert self._wake is not None
         while not self._stop_event.is_set():
-            await self._flush(force=self._first_tick)
+            backlog = False
+            # Cleared BEFORE the flush, as in the sync exporter.
+            refresh = self._refresh_requested
+            if refresh:
+                self._refresh_requested = False
+                if self._refresh_jitter:
+                    self._refresh_jitter = False
+                    await asyncio.sleep(random.uniform(0.0, _TENANT_WIDE_REFRESH_JITTER_SECONDS))
+                    if self._stop_event.is_set():
+                        break
+            try:
+                ok = await self._flush(force=self._first_tick or refresh)
+                backlog = ok and not self._queue.empty()
+            except Exception:  # noqa: BLE001 -- the exporter task must never die
+                _log.exception("telemetry exporter iteration failed; will retry")
             self._first_tick = False
+            if backlog:
+                continue
             try:
                 await asyncio.wait_for(
-                    self._stop_event.wait(),
+                    self._wake.wait(),
                     timeout=min(self._flush_interval, self._heartbeat_interval),
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
+            self._wake.clear()
 
     def _drain(self) -> list[dict[str, Any]]:
         assert self._queue is not None
@@ -518,13 +779,14 @@ class AsyncTelemetryExporter:
                 break
         return events
 
-    async def _flush(self, *, force: bool = False) -> None:
+    async def _flush(self, *, force: bool = False) -> bool:
+        """See TelemetryExporter._flush()."""
         self._ensure_bound()
         now = time.monotonic()
         events = self._drain()
         due_for_heartbeat = (now - self._last_flush_monotonic) >= self._heartbeat_interval
         if not events and not due_for_heartbeat and not force:
-            return
+            return True
         self._last_flush_monotonic = now
         try:
             # See the sync exporter's _flush() for why this goes through
@@ -540,16 +802,20 @@ class AsyncTelemetryExporter:
                 )
             )
         except GatewayError as exc:
-            assert self._queue is not None
-            for event in events:
-                try:
-                    self._queue.put_nowait(event)
-                except asyncio.QueueFull:
-                    self.dropped_count += 1
+            permanent = _is_permanent_rejection(exc)
+            if permanent:
+                self.dropped_count += len(events)
+                _log.warning("telemetry batch of %d rejected and dropped: %s", len(events), exc)
+            else:
+                self._requeue(events)
             if not self._fail_open:
                 _log.warning("telemetry flush failed (fail_open=False): %s", exc)
                 self.last_error = exc
-            return
+            return permanent
+        except Exception:  # noqa: BLE001 -- e.g. a malformed response; never lose the batch
+            _log.exception("telemetry flush failed unexpectedly; batch re-queued")
+            self._requeue(events)
+            return False
         heartbeat = (resp.data or {}).get("heartbeat") if isinstance(resp.data, dict) else None
         if heartbeat:
             self.state.update_from_heartbeat(heartbeat)
@@ -558,14 +824,29 @@ class AsyncTelemetryExporter:
                     float(self.state.telemetry_staleness_minutes)
                 )
             self._maybe_notify_suspend()
+        return True
+
+    def _requeue(self, events: list[dict[str, Any]]) -> None:
+        assert self._queue is not None
+        for event in events:
+            try:
+                self._queue.put_nowait(event)
+            except asyncio.QueueFull:
+                self.dropped_count += 1
 
     def _maybe_notify_suspend(self) -> None:
-        if self.state.is_suspended and not self._suspend_notified:
-            self._suspend_notified = True
-            if self._on_suspend:
-                self._on_suspend(self.state)
-        elif not self.state.is_suspended:
+        if not self.state.is_suspended:
             self._suspend_notified = False
+            return
+        if self._suspend_notified:
+            return
+        if self._on_suspend is None:
+            return  # stay un-notified so a later set_on_suspend() still fires
+        self._suspend_notified = True
+        try:
+            self._on_suspend(self.state)
+        except Exception:  # noqa: BLE001 -- a user callback must not kill the exporter
+            _log.exception("on_suspend callback raised")
 
     def is_suspended(self) -> bool:
         return self.state.is_suspended
