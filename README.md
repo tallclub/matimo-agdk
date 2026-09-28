@@ -139,27 +139,29 @@ before assuming attaching a callback/plugin alone is enough.
 | Framework | Register once | LLM through Gateway | Enforcement point | Signing on LLM calls | Verified against |
 |---|---|---|---|---|---|
 | LangChain | `MatimoCallbackHandler`/`AsyncMatimoCallbackHandler` (telemetry) **+** `govern_tools()` (enforcement) | `gateway_chat_model(provider="openai"\|"anthropic")` | `govern_tools()`'s wrapped `_run`/`_arun` -- the callback alone can only crash the chain, not deny gracefully (see the module docstring) | Full (`openai`), session-header-only (`anthropic`) | langchain-core 1.6.3, langchain-openai 1.6.2, langchain-anthropic 1.7.2 |
-| Google ADK | `MatimoPlugin(governor)` on `Runner(plugins=[...])` | `gateway_model()` (`LiteLlm`) | `MatimoPlugin.before_tool_callback`'s dict short-circuit -- ADK's own documented graceful-DENY contract | Live session token and run id per call (custom `LiteLLMClient`); no per-request signature | google-adk 2.9.1 (+ `extensions` extra) |
+| Google ADK | `MatimoPlugin(governor)` on `Runner(plugins=[...])` | `gateway_model()` (real `openai` SDK, no `litellm`) | `MatimoPlugin.before_tool_callback`'s dict short-circuit -- ADK's own documented graceful-DENY contract | Full: live session token, run id, and per-request JWS via `governor.httpx_async_client()` | google-adk 2.9.1, openai 2.54.0 |
 | CrewAI | `govern_crew(crew_or_agents, governor)` | `gateway_llm()` | The wrapped `_run`/`_arun` on each tool | Full: live session token, run id, and per-request JWS via CrewAI's transport interceptor (verified live with `requireSignedRequests=true`) | crewai 1.15.22 |
 | AutoGen | `govern_tools(tools, governor)` | `gateway_model_client()` | The wrapped `run()` on each `BaseTool` | Full | autogen-core/-agentchat/-ext 0.7.5 (modern generation only -- see below) |
 | Any other framework | `govern(callable_or_tools, governor)` | build your own client with `governor.openai_client_kwargs()`/`httpx_client()` | `governor.guard()` under the hood | Depends on your client | No framework dependency at all |
 
-**Sync vs. async governors.** `gateway_chat_model()` (LangChain),
-`gateway_model()` (ADK) and `gateway_llm()` (CrewAI) build their clients
-synchronously, so they need a sync `Governor`; passing an `AsyncGovernor`
-raises a `TypeError` that says so. A sync `Governor` still serves async
-framework code (blocking calls are moved to a thread). `gateway_model_client()`
-(AutoGen) is the reverse: it needs an `AsyncGovernor`. LangChain's `ChatOpenAI`
-is wired with the live sync client only, so its async methods (`ainvoke`) fall
+**Sync vs. async governors.** `gateway_chat_model()` (LangChain) and
+`gateway_llm()` (CrewAI) build their clients synchronously, so they need a
+sync `Governor`; passing an `AsyncGovernor` raises a `TypeError` that says
+so. A sync `Governor` still serves async framework code (blocking calls are
+moved to a thread). `gateway_model_client()` (AutoGen) and `gateway_model()`
+(ADK) are the reverse: both need an `AsyncGovernor`, because their
+underlying async client needs a live per-request signing hook only
+`AsyncGovernor.httpx_async_client()` provides. LangChain's `ChatOpenAI` is
+wired with the live sync client only, so its async methods (`ainvoke`) fall
 back to a session header fixed at construction and are not signed.
 
 **"Session-header-only" means**: the session token is attached, but there
 is no per-request `Matimo-Agent-Signature` (nonce + body hash) the way
-LangChain's OpenAI path and AutoGen get, because the underlying client
-(`ChatAnthropic`, ADK's `LiteLlm`, CrewAI's `LLM`) doesn't expose a
-request-hook mechanism this SDK can use. Each `gateway_*`/`govern_*`
-helper's own docstring explains exactly why, verified by reading the
-installed package's source, not assumed. If your tenant might ever enable
+LangChain's OpenAI path, AutoGen, and ADK get, because the underlying
+client (`ChatAnthropic`, CrewAI's `LLM`) doesn't expose a request-hook
+mechanism this SDK can use. Each `gateway_*`/`govern_*` helper's own
+docstring explains exactly why, verified by reading the installed package's
+source, not assumed. If your tenant might ever enable
 `requireSignedRequests`, prefer a path marked "Full" for that traffic.
 
 **AutoGen note**: `pyautogen` (the legacy 0.2-style `ConversableAgent`/

@@ -542,7 +542,7 @@ agent = Agent(name="weather", model=gateway_model(governor, model="gpt-4o-mini")
 runner = InMemoryRunner(agent=agent, plugins=[MatimoPlugin(governor)])
 ```
 
-One plugin governs every model and tool call the runner makes. A DENY, and a fail-closed Gateway outage, are returned through ADK's own before-tool short-circuit, so the agent sees a structured refusal rather than a crash. LLM calls carry the live session token and the ADK invocation id as the run id. They are not signed per request (litellm builds the body after the hook), so keep `requireSignedRequests` off for ADK identities or route through a custom `BaseLlm` built on `governor.httpx_client()`.
+One plugin governs every model and tool call the runner makes. A DENY, and a fail-closed Gateway outage, are returned through ADK's own before-tool short-circuit, so the agent sees a structured refusal rather than a crash. `gateway_model()` talks to Gateway's OpenAI-compatible endpoint through the real `openai` SDK directly (no `litellm` in this path), so LLM calls carry the live session token, the ADK invocation id as the run id, and a full per-request `Matimo-Agent-Signature` -- the same signing every other "Full" adapter gets. It needs an `AsyncGovernor`, not a sync `Governor`.
 
 ### CrewAI
 

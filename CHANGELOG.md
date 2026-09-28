@@ -6,6 +6,38 @@ All notable changes to this project are documented in this file.
 
 Initial core SDK build. Not yet published to PyPI.
 
+### Changed (2026-09-28, Google ADK's `gateway_model()` no longer routes through `litellm`)
+
+- **`matimo_agdk/adapters/_adk_openai.py`** (new): converts between ADK's
+  `LlmRequest`/`LlmResponse` and the real `openai` SDK's chat-completions
+  wire types. `gateway_model()`'s `MatimoLlm` now talks to Gateway's
+  OpenAI-compatible endpoint directly through `AsyncOpenAI`, replacing the
+  custom `LiteLLMClient`/`google.adk.models.lite_llm.LiteLlm` path added on
+  2026-09-18 (see that date's "Fixed" entry below for the implementation
+  this replaced).
+- **Full per-request `Matimo-Agent-Signature` signing on ADK LLM calls**,
+  via `AsyncGovernor.httpx_async_client()` — previously session-header-only,
+  because `litellm` serialized the request body after the signing hook ran.
+  `gateway_model()` now needs an `AsyncGovernor`, not a sync `Governor`.
+- **A denied/blocked ADK LLM call now raises this SDK's own `PolicyDenied`
+  (and `RateLimited`, `SpendCapExceeded`, etc.)**, like every other adapter,
+  instead of whatever `litellm`'s own unconditional exception remapping
+  produced.
+- `pyproject.toml`: the `google-adk` extra drops the `[extensions]` sub-extra
+  (that was only pulled in for ADK's own `litellm` bridge) and adds
+  `openai>=2.54` directly.
+- Updated `examples/{autogen,crewai,google_adk,langchain,plain_python}.py`
+  and `tests/adapters/test_google_adk.py`. Verified against `google-adk==2.9.1`
+  and `openai==2.54.0`.
+- **Known trade-off**: `_adk_openai.py` covers multi-turn text, images,
+  audio, tool calls, structured output, and streaming, but deliberately not
+  every backend-specific quirk `LiteLlm`'s ~3,500-line bridge handled for
+  non-OpenAI-wire providers (Gemini-native `response_schema`, Ollama message
+  flattening, etc.) — Gateway always presents one OpenAI-compatible wire
+  format regardless of the upstream provider, so those quirks don't apply
+  here. See the module's own docstring, "Scope relative to `LiteLlm`", for
+  the full list.
+
 ### Fixed (2026-09-27, a denied LLM call now raises a typed exception, not the raw SDK error)
 
 - **`_retry_transport.py`/`_retry_transport_httpx2.py`** (`SessionRetryTransport`/
@@ -544,12 +576,15 @@ added Dependabot for `uv` and GitHub Actions.
 ### Known gaps
 
 - No PyPI package published yet; install from a checkout.
-- Google ADK and LangChain-with-Anthropic paths send the session header
-  but no per-request signature (see the adapter docstrings).
+- The LangChain-with-Anthropic path sends the session header but no
+  per-request signature (see the adapter docstring). Google ADK got full
+  per-request signing on 2026-09-28 (see that date's entry above) and is no
+  longer part of this gap.
 - Rapid suspend is polled at the heartbeat interval, never pushed.
 - `gateway_chat_model(provider="openai")` wires the sync `http_client` only, so
   `ChatOpenAI` async methods use a session header fixed at construction and are
-  not signed. `gateway_*` helpers for LangChain, ADK and CrewAI need a sync
-  `Governor`; there is no async-native equivalent yet.
+  not signed. `gateway_*` helpers for LangChain and CrewAI need a sync
+  `Governor`; `gateway_model()` (ADK) and `gateway_model_client()` (AutoGen)
+  need an `AsyncGovernor` instead.
 - ADK plugin bookkeeping (`_open_runs`, `_pending_tool`) is not pruned for runs
   the caller abandons mid-stream.
