@@ -3,6 +3,11 @@ name: release
 # Pushing a tag vX.Y.Z (or a PEP 440 prerelease such as v0.2.0rc1) publishes matimo-agdk to
 # PyPI and creates the GitHub Release. See docs/RELEASING.md for the full procedure.
 #
+# The tag is cut from a release/vX.Y.Z branch, not from main -- main catches up via a PR
+# *after* the release publishes (same pattern matimo OSS uses: see that repo's release/v0.1.8
+# branch, still unmerged after typescript/v0.1.8 shipped). This lets a release go out without
+# waiting on an unrelated main-branch merge queue.
+#
 # Running this workflow by hand (Actions > release > Run workflow) is a dry run: it validates
 # the version files, runs the full CI gate and builds the package, but never publishes.
 on:
@@ -40,11 +45,18 @@ jobs:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v3
 
-      - name: Tag commit must be on main
+      - name: Tag commit must be on its release branch
         if: env.PUBLISH == 'true'
+        env:
+          RELEASE_BRANCH: release/${{ github.ref_name }}
         run: |
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Tag $GITHUB_REF_NAME points at a commit that is not on main. Merge it first, then tag main."
+          if ! git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" > /dev/null; then
+            echo "::error::No $RELEASE_BRANCH branch on origin. Cut the release from a release/vX.Y.Z branch first -- see docs/RELEASING.md."
+            exit 1
+          fi
+          git fetch --quiet origin "$RELEASE_BRANCH"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$RELEASE_BRANCH"; then
+            echo "::error::Tag $GITHUB_REF_NAME points at a commit that is not on $RELEASE_BRANCH."
             exit 1
           fi
 
