@@ -29,6 +29,11 @@ from matimo_agdk.adapters.autogen import (
     govern_tools,  # enforcement: policy-checks each tool call before it runs
 )
 
+# 3. Typed exception: a policy DENY on the LLM call itself (e.g. a model
+#    allow/deny-list rule), an exhausted spend cap, or a rapid suspend all
+#    raise this common base, not the LLM SDK's own unstructured error.
+from matimo_agdk.exceptions import GatewayError
+
 
 def calculator(expression: str) -> str:
     """Evaluate a simple arithmetic expression, e.g. '12 * 7'."""
@@ -56,9 +61,16 @@ async def main() -> None:
         )
         # Matimo: groups every span below under one run in the Gateway UI.
         async with governor.run("autogen-demo-run"):
-            response = await agent.on_messages(
-                [TextMessage(content=question, source="user")], CancellationToken()
-            )
+            try:
+                response = await agent.on_messages(
+                    [TextMessage(content=question, source="user")], CancellationToken()
+                )
+            except GatewayError as exc:
+                # Matimo: a denied/blocked LLM call -- print the reason and
+                # stop gracefully instead of letting a raw SDK traceback
+                # crash the agent. Retrying this exact call will simply recur.
+                print(f"Matimo Gateway blocked this call: {exc}")
+                return
             print(response.chat_message.content)
     finally:
         # Matimo: flush any queued telemetry and stop the background task.

@@ -24,6 +24,11 @@ from matimo_agdk.adapters.crewai import (
     govern_crew,  # enforcement: policy-checks every tool reachable from the crew
 )
 
+# 3. Typed exception: a policy DENY on the LLM call itself (e.g. a model
+#    allow/deny-list rule), an exhausted spend cap, or a rapid suspend all
+#    raise this common base, not the LLM SDK's own unstructured error.
+from matimo_agdk.exceptions import GatewayError
+
 
 @tool("search")
 def search(query: str) -> str:
@@ -55,7 +60,13 @@ def main() -> None:
 
         # Matimo: groups every span below under one run in the Gateway UI.
         with governor.run("crewai-demo-run"):
-            print(crew.kickoff())
+            try:
+                print(crew.kickoff())
+            except GatewayError as exc:
+                # Matimo: a denied/blocked LLM call -- print the reason and
+                # stop gracefully instead of letting a raw SDK traceback
+                # crash the crew. Retrying this exact call will simply recur.
+                print(f"Matimo Gateway blocked this call: {exc}")
     finally:
         # Matimo: flush any queued telemetry and stop the background thread.
         governor.stop()

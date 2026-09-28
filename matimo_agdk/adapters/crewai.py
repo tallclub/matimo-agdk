@@ -71,6 +71,7 @@ from typing import Any
 
 from .._outage import degraded_attributes
 from ..exceptions import ToolDenied
+from ..transport import parse_retry_after, raise_for_error
 from ._shared import (
     Mode,
     async_check_and_wait,
@@ -141,6 +142,29 @@ def _usage_and_model_from_body(body: bytes) -> tuple[dict[str, Any], str | None]
             attrs["gen_ai.usage.output_tokens"] = usage["completion_tokens"]
     model = data.get("model")
     return attrs, (str(model) if model else None)
+
+
+def _raise_typed_gateway_error(response: Any, body_bytes: bytes | None) -> None:
+    """Raises this SDK's own typed exception (`PolicyDenied`, `RateLimited`,
+    ...) for a non-2xx Gateway response -- the same `raise_for_error()`
+    mapping Governor's own transport uses for every other Gateway call
+    (`_retry_transport.py`'s `_raise_typed_error_for_403`) -- so a denied LLM
+    call made through `gateway_llm()` raises exactly like a denied tool call
+    does, instead of CrewAI's own unstructured `openai.PermissionDeniedError`.
+    Always raises: `raise_for_error()`'s own final branch raises a generic
+    `GatewayError` even for a body it doesn't recognize.
+    """
+    body: Any = None
+    if body_bytes:
+        try:
+            body = json.loads(body_bytes)
+        except ValueError:
+            body = None
+    raise_for_error(
+        response.status_code,
+        body if isinstance(body, dict) else None,
+        parse_retry_after(response.headers.get("Retry-After")),
+    )
 
 
 def _wrap_sync_run(
@@ -314,6 +338,14 @@ def gateway_llm(governor: Any, *, model: str | None = None, **kwargs: Any) -> An
     `TypeError`: its session handshake must be awaited, and this builder is
     synchronous); a sync `Governor` still serves async CrewAI code. Session
     expiry is not retried here; the default session TTL is one hour.
+
+    **A denied call raises `PolicyDenied`, like every other adapter.**
+    `MatimoInterceptor.on_inbound()`/`aon_inbound()` see the raw Gateway
+    response before CrewAI's own OpenAI SDK call does (same extension point
+    `_retry_transport.py` uses for the httpx-client-wired adapters), and
+    raise this SDK's own typed exception directly on a non-2xx response
+    (`_raise_typed_gateway_error()`) instead of letting CrewAI build its own
+    unstructured `openai.PermissionDeniedError` from it.
     """
     headers = default_llm_headers(governor, "gateway_llm")
     model_name = model or "matimo/auto"
@@ -366,10 +398,15 @@ def make_interceptor(governor: Any) -> Any:
             started, request_model = _PENDING_LLM_CALL.get() or (_now(), None)
             attrs: dict[str, Any] = {}
             response_model = None
-            if "text/event-stream" not in message.headers.get("content-type", ""):
+            body_bytes: bytes | None = None
+            if not message.is_success or "text/event-stream" not in message.headers.get(
+                "content-type", ""
+            ):
                 try:
                     message.read()
-                    attrs, response_model = _usage_and_model_from_body(message.content)
+                    body_bytes = message.content
+                    if message.is_success:
+                        attrs, response_model = _usage_and_model_from_body(body_bytes)
                 except Exception:  # noqa: BLE001 -- telemetry must never break the real call
                     pass
             emit_llm_span(
@@ -380,6 +417,11 @@ def make_interceptor(governor: Any) -> Any:
                 duration_ms=int((_now() - started) * 1000),
                 attributes=attrs or None,
             )
+            if not message.is_success:
+                # Raised from the transport, before CrewAI's own OpenAI SDK
+                # call sees the response -- see _raise_typed_gateway_error()'s
+                # own docstring for why this must happen here.
+                _raise_typed_gateway_error(message, body_bytes)
             return message
 
         async def aon_outbound(self, message: httpx.Request) -> httpx.Request:
@@ -389,10 +431,15 @@ def make_interceptor(governor: Any) -> Any:
             started, request_model = _PENDING_LLM_CALL.get() or (_now(), None)
             attrs: dict[str, Any] = {}
             response_model = None
-            if "text/event-stream" not in message.headers.get("content-type", ""):
+            body_bytes: bytes | None = None
+            if not message.is_success or "text/event-stream" not in message.headers.get(
+                "content-type", ""
+            ):
                 try:
                     await message.aread()
-                    attrs, response_model = _usage_and_model_from_body(message.content)
+                    body_bytes = message.content
+                    if message.is_success:
+                        attrs, response_model = _usage_and_model_from_body(body_bytes)
                 except Exception:  # noqa: BLE001
                     pass
             emit_llm_span(
@@ -403,6 +450,8 @@ def make_interceptor(governor: Any) -> Any:
                 duration_ms=int((_now() - started) * 1000),
                 attributes=attrs or None,
             )
+            if not message.is_success:
+                _raise_typed_gateway_error(message, body_bytes)
             return message
 
     return MatimoInterceptor()

@@ -36,7 +36,11 @@ langchain = [
     "langchain-anthropic>=1.7",
 ]
 google-adk = [
-    "google-adk[extensions]>=2.9",
+    # No `[extensions]` extra: gateway_model() talks to the real `openai` SDK
+    # directly (matimo_agdk/adapters/_adk_openai.py), not litellm, which is
+    # all `[extensions]` was pulled in for.
+    "google-adk>=2.9",
+    "openai>=2.54",
 ]
 crewai = ["crewai>=1.15"]
 autogen = [

@@ -26,6 +26,10 @@ from matimo_agdk import Governor
 #    governor.httpx_client() does the LLM routing (see the calls below).
 #    matimo_agdk.adapters.generic.govern() is the shortcut for guarding a whole
 #    dict/list of tool functions at once.
+# 3. Typed exception: a policy DENY on the LLM call itself (e.g. a model
+#    allow/deny-list rule), an exhausted spend cap, or a rapid suspend all
+#    raise this common base, not the LLM SDK's own unstructured error.
+from matimo_agdk.exceptions import GatewayError
 
 
 def search(query: str) -> str:
@@ -72,10 +76,17 @@ def main() -> None:
                 # signature covers each request's own body bytes.
                 http_client=governor.httpx_client(),
             )
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": mission}],
-            )
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": mission}],
+                )
+            except GatewayError as exc:
+                # Matimo: a denied/blocked LLM call -- print the reason and
+                # stop gracefully instead of letting a raw SDK traceback
+                # crash the script. Retrying this exact call will simply recur.
+                print(f"Matimo Gateway blocked this call: {exc}")
+                return
             answer = response.choices[0].message.content
             print(f"LLM answer: {answer}")
 

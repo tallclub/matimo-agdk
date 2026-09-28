@@ -20,13 +20,23 @@ from google.genai import types
 # --- Matimo AGDK imports (same three roles in every example) ---------------
 # 1. Governor: the core object. Holds this agent's registered identity, sends
 #    telemetry to Matimo Gateway, and answers "is this tool call allowed?".
-from matimo_agdk import Governor
+#    AsyncGovernor here, not the sync Governor: gateway_model() talks to
+#    Gateway via the real openai SDK's AsyncOpenAI, which needs
+#    AsyncGovernor.httpx_async_client() for full per-request signing --
+#    see gateway_model()'s own docstring.
+from matimo_agdk import AsyncGovernor
 
 # 2. Google ADK adapter (matimo_agdk.adapters.google_adk):
 from matimo_agdk.adapters.google_adk import (
     MatimoPlugin,  # telemetry + enforcement: an ADK plugin that policy-checks every tool call
-    gateway_model,  # LLM routing: a LiteLlm model already pointed at Matimo Gateway
+    gateway_model,  # LLM routing: a BaseLlm (real openai SDK) already pointed at Matimo Gateway
 )
+
+# 3. Typed exception: a policy DENY on the LLM call itself (e.g. a model
+#    allow/deny-list rule), an exhausted spend cap, or a rapid suspend all
+#    raise this common base -- not the LLM SDK's own unstructured error --
+#    see gateway_model()'s own docstring for why that wasn't always true.
+from matimo_agdk.exceptions import GatewayError
 
 
 def get_weather(city: str) -> dict:
@@ -38,8 +48,8 @@ async def main() -> None:
     question = " ".join(sys.argv[1:]) or "What's the weather in Bengaluru?"
     # Matimo: load the identity created by `matimo-agdk register` (plus the
     # API key / Gateway URL from env vars), then start background telemetry.
-    governor = Governor.from_env(agent_name="google_adk_agent")
-    governor.start()
+    governor = AsyncGovernor.from_env(agent_name="google_adk_agent")
+    await governor.start()
 
     try:
         agent = Agent(
@@ -57,15 +67,21 @@ async def main() -> None:
             app_name=runner.app_name, user_id="demo-user"
         )
         message = types.Content(role="user", parts=[types.Part(text=question)])
-        async for event in runner.run_async(
-            user_id="demo-user", session_id=session.id, new_message=message
-        ):
-            for part in event.content.parts if event.content else []:
-                if part.text:
-                    print(part.text)
+        try:
+            async for event in runner.run_async(
+                user_id="demo-user", session_id=session.id, new_message=message
+            ):
+                for part in event.content.parts if event.content else []:
+                    if part.text:
+                        print(part.text)
+        except GatewayError as exc:
+            # Matimo: a denied/blocked LLM call -- print the reason and stop
+            # gracefully instead of letting a raw SDK traceback crash the
+            # agent. Retrying this exact call will simply recur.
+            print(f"Matimo Gateway blocked this call: {exc}")
     finally:
-        # Matimo: flush any queued telemetry and stop the background thread.
-        governor.stop()
+        # Matimo: flush any queued telemetry and stop the background task.
+        await governor.stop()
 
 
 if __name__ == "__main__":

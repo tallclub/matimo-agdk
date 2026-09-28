@@ -26,9 +26,10 @@ from matimo_agdk.adapters.langchain import (
 )
 
 # 3. Typed exception: a policy DENY on the LLM call itself (e.g. a model
-#    allow/deny-list rule) raises this, not the LLM SDK's own unstructured
-#    error -- see gateway_chat_model()'s own docstring.
-from matimo_agdk.exceptions import PolicyDenied
+#    allow/deny-list rule), an exhausted spend cap, or a rapid suspend all
+#    raise this common base, not the LLM SDK's own unstructured error -- see
+#    gateway_chat_model()'s own docstring.
+from matimo_agdk.exceptions import GatewayError
 
 
 @tool
@@ -59,11 +60,11 @@ def main() -> None:
         with governor.run("langchain-demo-run"):
             try:
                 response = model.invoke(question, config={"callbacks": [handler]})
-            except PolicyDenied as exc:
-                # Matimo: a denied LLM call -- print the reason and stop
-                # gracefully instead of letting a raw SDK traceback crash
-                # the agent. Retrying this exact call will simply recur.
-                print(f"Model call denied by Matimo Gateway: {exc.reason}")
+            except GatewayError as exc:
+                # Matimo: a denied/blocked LLM call -- print the reason and
+                # stop gracefully instead of letting a raw SDK traceback
+                # crash the agent. Retrying this exact call will simply recur.
+                print(f"Matimo Gateway blocked this call: {exc}")
                 return
             print(f"Model response: {response.content!r}")
             if response.tool_calls:

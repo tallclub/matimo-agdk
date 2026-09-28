@@ -1,5 +1,4 @@
-"""Google ADK adapter. Verified against google-adk==2.9.1 (with the
-`extensions` extra, which pulls in `litellm` for `gateway_model()`).
+"""Google ADK adapter. Verified against google-adk==2.9.1 and openai==2.54.0.
 
 Install with `pip install matimo-agdk[google-adk]`.
 
@@ -24,9 +23,13 @@ Two pieces:
   `before_model_callback(*, callback_context, llm_request)`,
   `after_model_callback(*, callback_context, llm_response)`,
   `on_tool_error_callback(*, tool, tool_args, tool_context, error)`.
-- `gateway_model(governor, model=...)` -- a `LiteLlm` instance pointed at
-  Gateway's OpenAI-compatible endpoint. **Session-header-only, signing
-  off** -- see its own docstring for exactly why and what that means.
+- `gateway_model(governor, model=...)` -- a `MatimoLlm` (`BaseLlm`) instance
+  pointed at Gateway's OpenAI-compatible endpoint, talking to the real
+  `openai` SDK directly -- no `litellm` anywhere in this path (see
+  `_adk_openai.py`'s own module docstring for exactly why, and its "Scope
+  relative to LiteLlm" section for what that trades away). Needs an
+  `AsyncGovernor`, not a sync `Governor` -- see `gateway_model()`'s own
+  docstring.
 
 ## What enforces what
 
@@ -57,7 +60,7 @@ own dict-return contract does, this genuinely halts the run (matches the
 
 `before_model_callback`/`after_model_callback` bracket every model call
 ADK makes, regardless of which underlying model backend is configured
-(Gemini, LiteLlm, or anything else) -- so telemetry works even for a
+(Gemini, `MatimoLlm`, or anything else) -- so telemetry works even for a
 Gemini-native agent that never goes through `gateway_model()`/Gateway at
 all (matching this SDK's honest "AGDK never sees your real LLM traffic
 unless it goes through Gateway" framing: spans still get recorded, they
@@ -87,29 +90,69 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 import uuid
 from typing import Any
 
+from pydantic import ConfigDict, PrivateAttr
+
 from .._outage import degraded_attributes
-from ..exceptions import ToolCheckUnavailable
+from ..exceptions import GatewayError, ToolCheckUnavailable
+from . import _adk_openai
 from ._shared import (
     Mode,
     async_check_and_wait,
     async_raise_if_suspended,
     check_mode,
-    default_llm_headers,
     emit_llm_span,
     emit_tool_span,
+    is_async_governor,
 )
 
 try:
+    from google.adk.models import LlmCapabilities
+    from google.adk.models.base_llm import BaseLlm
     from google.adk.plugins.base_plugin import BasePlugin
 except ImportError as exc:  # pragma: no cover - exercised only when the extra is missing
     raise ImportError(
         "matimo_agdk.adapters.google_adk requires the 'google-adk' extra: "
         "pip install matimo-agdk[google-adk]"
     ) from exc
+
+
+class _QuietExpectedGatewayErrors(logging.Filter):
+    """A `gateway_model()` DENY has no graceful-return contract the way a
+    tool DENY does (`before_tool_callback`'s short-circuit dict -- see this
+    module's own docstring) -- `MatimoLlm.generate_content_async()` must
+    raise, and ADK's own node runner logs *every* exception that propagates
+    out of a node/root run at ERROR level with a full traceback before
+    re-raising it: `google.adk.workflow._node_runner.NodeRunner.run`'s
+    `logger.exception("Node execution failed with exception")` and
+    `google.adk.runners.Runner._cleanup_root_task`'s
+    `logger.error('Root node %s failed.', ..., exc_info=True)` (verified
+    against google-adk==2.9.1, the same version pin as the rest of this
+    file). That is correct behavior for a genuine ADK-internal bug and pure
+    noise for an expected `GatewayError` -- which every example's own
+    `except GatewayError` already prints as one clean line. Drop only
+    records whose exception is ours; anything else ADK logs at ERROR still
+    goes through untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        return not isinstance(exc, GatewayError)
+
+
+def _quiet_expected_gateway_errors() -> None:
+    quiet_filter = _QuietExpectedGatewayErrors()
+    for name in ("google.adk.runners", "google.adk.workflow._node_runner"):
+        adk_logger = logging.getLogger(name)
+        if not any(isinstance(f, _QuietExpectedGatewayErrors) for f in adk_logger.filters):
+            adk_logger.addFilter(quiet_filter)
+
+
+_quiet_expected_gateway_errors()
 
 
 def _now() -> float:
@@ -352,63 +395,101 @@ class MatimoPlugin(BasePlugin):  # type: ignore[misc]
             pass
 
 
-def gateway_model(governor: Any, *, model: str | None = None, **kwargs: Any) -> Any:
-    """Returns a `google.adk.models.lite_llm.LiteLlm` pointed at Gateway's
-    OpenAI-compatible endpoint (`LiteLlm` requires `litellm`, pulled in by
-    `matimo-agdk[google-adk]`).
-
-    **Live headers per request, no signature (2026-09-18).** `LiteLlm`
-    accepts a custom `llm_client` (`LiteLLMClient`); the client returned by
-    `make_lite_llm_client()` overrides `completion()`/`acompletion()` to
-    merge the governor's current session token and run id into
-    `extra_headers` on every call, so ADK LLM calls correlate to
-    `governor.run()` ids in the call log and survive a session renewal.
-    Still not possible: a per-request `Matimo-Agent-Signature`, because
-    litellm serialises the body itself after this hook runs. If your tenant
-    enables `requireSignedRequests`, route ADK's traffic through a custom
-    `BaseLlm` built on `governor.httpx_client()` instead.
+class MatimoLlm(BaseLlm):  # type: ignore[misc]
+    """A `BaseLlm` that talks to Matimo Gateway's OpenAI-compatible endpoint
+    directly via the real `openai` SDK -- see `gateway_model()`'s own
+    docstring for why this replaced a `LiteLlm`-based implementation, and
+    `_adk_openai.py`'s module docstring for the full request/response
+    conversion and its disclosed scope limits. Built by `gateway_model()`;
+    construct it directly only if you need to override `capabilities` or
+    `supported_models` by subclassing it.
     """
-    from google.adk.models.lite_llm import LiteLlm
 
-    headers = default_llm_headers(governor, "gateway_model")
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    _client: Any = PrivateAttr()
+    _extra_kwargs: dict[str, Any] = PrivateAttr(default_factory=dict)
+
+    def __init__(self, model: str, *, governor: Any, **kwargs: Any) -> None:
+        if not is_async_governor(governor):
+            raise TypeError(
+                "gateway_model() needs an AsyncGovernor -- generate_content_async() "
+                "is fully async and needs an httpx.AsyncClient with live per-request "
+                "signing, which only AsyncGovernor.httpx_async_client() provides. "
+                "Use AsyncGovernor.from_env() instead of Governor.from_env()."
+            )
+        super().__init__(model=model)
+        from openai import AsyncOpenAI
+
+        self._client = AsyncOpenAI(
+            base_url=governor.config.base_url,
+            api_key=governor.config.api_key or "matimo-gateway",
+            http_client=governor.httpx_async_client(),
+        )
+        self._extra_kwargs = kwargs
+
+    @property
+    def capabilities(self) -> LlmCapabilities:
+        return LlmCapabilities(output_schema_and_tools=True)
+
+    @classmethod
+    def supported_models(cls) -> list[str]:
+        # Constructed directly by gateway_model(), never resolved by name
+        # through ADK's LlmRegistry -- no patterns to register.
+        return []
+
+    async def generate_content_async(self, llm_request: Any, stream: bool = False) -> Any:
+        self._maybe_append_user_content(llm_request)
+        _adk_openai._append_fallback_user_content_if_missing(llm_request)
+        effective_model = llm_request.model or self.model
+        kwargs = _adk_openai.build_completion_kwargs(llm_request, effective_model)
+        kwargs.update(self._extra_kwargs)
+
+        if stream:
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+            response = await self._client.chat.completions.create(**kwargs)
+            async for llm_response in _adk_openai.stream_llm_responses(response):
+                yield llm_response
+        else:
+            response = await self._client.chat.completions.create(**kwargs)
+            yield _adk_openai.completion_to_llm_response(response)
+
+
+def gateway_model(governor: Any, *, model: str | None = None, **kwargs: Any) -> Any:
+    """Returns a `BaseLlm` pointed at Gateway's OpenAI-compatible endpoint,
+    talking to the real `openai` SDK directly -- no `litellm` in this path
+    (see `_adk_openai.py`'s own module docstring for why, and what that
+    trades away relative to `google.adk.models.lite_llm.LiteLlm`, which this
+    replaced).
+
+    **Needs an `AsyncGovernor`, not a sync `Governor`.**
+    `generate_content_async()` is fully async and needs an
+    `httpx.AsyncClient` with a live per-request signing hook, which only
+    `AsyncGovernor.httpx_async_client()` provides -- the same constraint
+    AutoGen's `gateway_model_client()` already documents. Use
+    `AsyncGovernor.from_env()` instead of `Governor.from_env()`.
+
+    **Full per-request `Matimo-Agent-Signature` signing, unlike the old
+    `LiteLlm`-based implementation.** `governor.httpx_async_client()`
+    attaches the live session token, current `governor.run()` id, and (when
+    signing is enabled) a signature over each request's exact body bytes,
+    via the same transport-level hook every other Gateway call uses
+    (`_retry_transport.py`) -- there is no serialization layer in between to
+    lose it, unlike routing through `litellm`.
+
+    **A denied call raises `PolicyDenied`, like every other adapter.** The
+    real `openai` SDK's own `_base_client.request()` re-raises an
+    already-`OpenAIError` exception (`GatewayError`'s base) untouched, so
+    Governor's transport-raised typed exception reaches the caller exactly
+    as raised -- no recovery/remapping step needed, unlike the `litellm`
+    path this replaced.
+
+    `model` defaults to `"matimo/auto"` (Gateway's own routing sentinel).
+    Any other keyword arguments are merged into every
+    `chat.completions.create()` call, letting an unrecognized/passthrough
+    parameter go through `extra_body` explicitly if the real SDK's typed
+    signature would otherwise reject it.
+    """
     model_name = model or "matimo/auto"
-    return LiteLlm(
-        model=f"openai/{model_name}",
-        api_base=governor.config.base_url,
-        api_key=governor.config.api_key or "matimo-gateway",
-        extra_headers=headers,
-        llm_client=make_lite_llm_client(governor),
-        **kwargs,
-    )
-
-
-def make_lite_llm_client(governor: Any) -> Any:
-    """A `LiteLLMClient` that injects `governor.request_headers()` into
-    `extra_headers` on every completion call. Public so a custom `LiteLlm`
-    subclass can reuse it."""
-    from google.adk.models.lite_llm import LiteLLMClient
-
-    def _sync_live() -> dict[str, str]:
-        fn = governor.request_headers
-        if inspect.iscoroutinefunction(fn):
-            return {}
-        return dict(fn())
-
-    async def _async_live() -> dict[str, str]:
-        result = governor.request_headers()
-        if inspect.isawaitable(result):
-            result = await result
-        return dict(result)
-
-    class MatimoLiteLLMClient(LiteLLMClient):  # type: ignore[misc]
-        async def acompletion(self, model: Any, messages: Any, tools: Any, **kw: Any) -> Any:
-            kw["extra_headers"] = {**(kw.get("extra_headers") or {}), **(await _async_live())}
-            return await super().acompletion(model, messages, tools, **kw)
-
-        def completion(
-            self, model: Any, messages: Any, tools: Any, stream: bool = False, **kw: Any
-        ) -> Any:
-            kw["extra_headers"] = {**(kw.get("extra_headers") or {}), **_sync_live()}
-            return super().completion(model, messages, tools, stream=stream, **kw)
-
-    return MatimoLiteLLMClient()
+    return MatimoLlm(model=model_name, governor=governor, **kwargs)

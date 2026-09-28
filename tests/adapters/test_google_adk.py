@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -13,6 +14,38 @@ from matimo_agdk.tools import ToolDecision
 
 from ..conftest import BASE_URL, future_iso
 from .conftest import bound_async_governor
+
+
+def _real_llm_request(question: str, *, with_weather_tool: bool = False):
+    """A real `google.adk.models.llm_request.LlmRequest`, for tests that
+    exercise `gateway_model()`'s actual request/response conversion (the
+    lightweight `_LlmRequest` stand-in above only carries `.model`, which
+    isn't enough here)."""
+    from google.adk.models.llm_request import LlmRequest
+    from google.genai import types
+
+    config_kwargs: dict = {}
+    if with_weather_tool:
+        config_kwargs["system_instruction"] = "Answer using the tool."
+        config_kwargs["tools"] = [
+            types.Tool(
+                function_declarations=[
+                    types.FunctionDeclaration(
+                        name="get_weather",
+                        description="Look up the weather for a city.",
+                        parameters=types.Schema(
+                            type=types.Type.OBJECT,
+                            properties={"city": types.Schema(type=types.Type.STRING)},
+                            required=["city"],
+                        ),
+                    )
+                ]
+            )
+        ]
+    return LlmRequest(
+        contents=[types.Content(role="user", parts=[types.Part.from_text(text=question)])],
+        config=types.GenerateContentConfig(**config_kwargs),
+    )
 
 
 class _Tool:
@@ -224,50 +257,121 @@ async def test_llm_span_carries_model_and_usage() -> None:
     assert kwargs["finish_reasons"] == ["STOP"]
 
 
-def test_gateway_model_returns_lite_llm_pointed_at_gateway() -> None:
+def test_gateway_model_requires_async_governor() -> None:
     from matimo_agdk.adapters.google_adk import gateway_model
 
     gov = MagicMock()
-    gov.config.base_url = BASE_URL
-    gov.config.api_key = "org-key"
-    gov.openai_client_kwargs.return_value = {"default_headers": {"X-Matimo-Session-Token": "tok"}}
-
-    model = gateway_model(gov, model="gpt-4o-mini")
-    assert model.model == "openai/gpt-4o-mini"
+    gov.check_tool = MagicMock()  # not a coroutine function -> sync Governor
+    with pytest.raises(TypeError, match="AsyncGovernor"):
+        gateway_model(gov, model="gpt-4o-mini")
 
 
-def test_gateway_model_client_injects_live_headers_per_call(monkeypatch) -> None:
-    import asyncio
-
-    import google.adk.models.lite_llm as lite_llm_module
-
+def test_gateway_model_returns_matimo_llm_pointed_at_gateway() -> None:
     from matimo_agdk.adapters.google_adk import gateway_model
 
     gov = MagicMock()
+    gov.check_tool = AsyncMock()  # coroutine function -> AsyncGovernor
     gov.config.base_url = BASE_URL
     gov.config.api_key = "org-key"
-    gov.openai_client_kwargs.return_value = {"default_headers": {"X-Matimo-Session-Token": "tok"}}
-    gov.request_headers = MagicMock(
-        return_value={"X-Matimo-Session-Token": "live-tok", "X-Matimo-Run-Id": "run-7"}
-    )
-    seen: dict = {}
-
-    async def fake_acompletion(**kw):
-        seen.update(kw)
-        return MagicMock()
-
-    monkeypatch.setattr(lite_llm_module, "_ensure_litellm_imported", lambda: None)
-    monkeypatch.setattr(lite_llm_module, "acompletion", fake_acompletion)
+    gov.httpx_async_client = MagicMock(return_value=httpx.AsyncClient())
 
     model = gateway_model(gov, model="gpt-4o-mini")
-    asyncio.run(
-        model.llm_client.acompletion(
-            "openai/gpt-4o-mini", [], None, extra_headers={"X-Static": "1"}
+    assert model.model == "gpt-4o-mini"
+    assert str(model._client.base_url).rstrip("/") == BASE_URL  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_gateway_model_denied_call_raises_policy_denied(
+    identity: IdentityCredentials, credentials_dir
+) -> None:
+    """The regression test for the original bug report: a Gateway policy
+    DENY on the LLM call must reach the caller as `PolicyDenied`, not a raw
+    SDK error -- see this adapter's own docstring and _adk_openai.py's for
+    why routing through litellm used to destroy that type."""
+    from matimo_agdk.adapters.google_adk import gateway_model
+    from matimo_agdk.exceptions import PolicyDenied
+
+    _mock_sessions_and_telemetry()
+    respx.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=httpx.Response(
+            403, json={"error": "policy_denied", "message": "Deny gpt-4 model"}
         )
     )
-    assert seen["extra_headers"]["X-Matimo-Session-Token"] == "live-tok"
-    assert seen["extra_headers"]["X-Matimo-Run-Id"] == "run-7"
-    assert seen["extra_headers"]["X-Static"] == "1"
+    governor = bound_async_governor(identity, credentials_dir)
+    model = gateway_model(governor, model="gpt-4")
+
+    llm_request = _real_llm_request("What's 12 * 7?")
+    with pytest.raises(PolicyDenied, match="Deny gpt-4 model"):
+        async for _ in model.generate_content_async(llm_request):
+            pass
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_gateway_model_generate_content_async_converts_request_and_response(
+    identity: IdentityCredentials, credentials_dir
+) -> None:
+    """End-to-end through the real openai SDK and a mocked Gateway response:
+    system instruction, tool schema, and a tool-call response all round-trip
+    without litellm anywhere in the path."""
+    from matimo_agdk.adapters.google_adk import gateway_model
+
+    _mock_sessions_and_telemetry()
+    captured: dict = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "cc1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-4o-mini",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city": "Bengaluru"}',
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+
+    respx.post(f"{BASE_URL}/chat/completions").mock(side_effect=responder)
+    governor = bound_async_governor(identity, credentials_dir)
+    model = gateway_model(governor, model="gpt-4o-mini")
+
+    llm_request = _real_llm_request("weather in Bengaluru?", with_weather_tool=True)
+    responses = [r async for r in model.generate_content_async(llm_request)]
+
+    assert len(responses) == 1
+    response = responses[0]
+    function_call = response.content.parts[0].function_call
+    assert function_call.name == "get_weather"
+    assert function_call.args == {"city": "Bengaluru"}
+    assert response.usage_metadata.prompt_token_count == 10
+
+    assert captured["body"]["messages"][0] == {
+        "role": "system",
+        "content": "Answer using the tool.",
+    }
+    assert captured["body"]["tools"][0]["function"]["name"] == "get_weather"
 
 
 async def test_before_model_binds_invocation_id_as_current_run() -> None:
