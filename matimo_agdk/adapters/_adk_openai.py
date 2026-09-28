@@ -96,13 +96,15 @@ _MEDIA_CONTENT_KIND_BY_MAJOR_MIME_TYPE = {
 # Document types OpenAI's chat completions API accepts inline as base64
 # `file_data` (no upload/file_id round trip -- see this module's own
 # docstring for why that flow is out of scope).
-_SUPPORTED_INLINE_FILE_MIME_TYPES = frozenset({
-    "application/pdf",
-    "application/msword",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    "application/json",
-})
+_SUPPORTED_INLINE_FILE_MIME_TYPES = frozenset(
+    {
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/json",
+    }
+)
 
 _UNQUOTED_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -479,9 +481,7 @@ def _parts_to_openai_content(parts: list[types.Part]) -> str | list[dict[str, An
         if part.inline_data and part.inline_data.data and part.inline_data.mime_type:
             mime_type = part.inline_data.mime_type.split(";", 1)[0].strip().lower()
             if mime_type.startswith("text/"):
-                content.append(
-                    {"type": "text", "text": _decode_inline_text(part.inline_data.data)}
-                )
+                content.append({"type": "text", "text": _decode_inline_text(part.inline_data.data)})
                 continue
             b64 = base64.b64encode(part.inline_data.data).decode("utf-8")
             kind = _mime_content_kind(mime_type)
@@ -543,9 +543,7 @@ def _content_to_openai_messages(content: types.Content) -> list[dict[str, Any]]:
     for part in parts:
         if part.function_response:
             fr = part.function_response
-            response_text = (
-                fr.response if isinstance(fr.response, str) else json.dumps(fr.response)
-            )
+            response_text = fr.response if isinstance(fr.response, str) else json.dumps(fr.response)
             tool_messages.append(
                 {"role": "tool", "tool_call_id": fr.id or "", "content": response_text}
             )
@@ -896,9 +894,7 @@ async def stream_llm_responses(stream: Any) -> AsyncGenerator[Any]:
         entry = function_calls[index]
         if not entry["id"] and not entry["name"]:
             continue
-        tool_calls.append(
-            (entry["id"] or str(index), entry["name"], "".join(entry["args_parts"]))
-        )
+        tool_calls.append((entry["id"] or str(index), entry["name"], "".join(entry["args_parts"])))
 
     llm_response = _message_to_llm_response(
         content=final_content,

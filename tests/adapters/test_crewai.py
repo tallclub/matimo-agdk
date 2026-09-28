@@ -10,7 +10,7 @@ import respx
 from crewai.tools import BaseTool
 from pydantic import BaseModel
 
-from matimo_agdk.exceptions import AgentSuspendedLocally, ToolDenied
+from matimo_agdk.exceptions import AgentSuspendedLocally, GatewayError, ToolDenied
 from matimo_agdk.identity import IdentityCredentials
 from matimo_agdk.tools import ToolDecision
 
@@ -275,7 +275,10 @@ def test_interceptor_marks_non_2xx_response_as_error_span() -> None:
     resp = httpx.Response(
         500, headers={"content-type": "application/json"}, content=b'{"error":"boom"}'
     )
-    interceptor.on_inbound(resp)
+    # The interceptor now raises the typed exception itself (see on_inbound's
+    # docstring) -- the span must still be recorded before that raise propagates.
+    with pytest.raises(GatewayError):
+        interceptor.on_inbound(resp)
 
     assert gov.llm_span.call_args.kwargs["status"] == "error"
     # requested model still reported even though the error body has no "model" key
