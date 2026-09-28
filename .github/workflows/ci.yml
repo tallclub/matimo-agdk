@@ -26,8 +26,8 @@ jobs:
             extras: "--extra langchain --extra google-adk --extra autogen"
             pytest_args: "--ignore=tests/adapters/test_crewai.py"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Set up Python ${{ matrix.python }}
@@ -51,8 +51,8 @@ jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Set up Python
@@ -69,7 +69,7 @@ jobs:
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/smoke/bin/python" -c "import matimo_agdk; print('matimo_agdk', matimo_agdk.__version__)"
           "$RUNNER_TEMP/smoke/bin/matimo-agdk" --help > /dev/null
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -80,7 +80,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: wagoid/commitlint-github-action@v6
